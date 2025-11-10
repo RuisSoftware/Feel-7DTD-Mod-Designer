@@ -49,7 +49,10 @@ public class EntryXmlModule : IConfigModule
     private GUIStyle patchLabelStyle;
     private Color patchSelectedColor = new Color(1f, 0.6f, 0.2f, 0.35f);
 
-
+    HashSet<string> _knownNames = new(StringComparer.OrdinalIgnoreCase);
+    HashSet<string> _knownItems = new(StringComparer.OrdinalIgnoreCase);
+    HashSet<string> _knownBlocks = new(StringComparer.OrdinalIgnoreCase);
+    string[] _knownNamesArr = Array.Empty<string>();
 
     public bool HasNoEntries
     {
@@ -79,6 +82,7 @@ public class EntryXmlModule : IConfigModule
         doc = XDocument.Load(filePath);
         RebuildEntries();
         RebuildPatches();
+        BuildValidNameIndex();
     }
 
     XElement EnsureAppendToRootPatchElement() // NEW
@@ -244,6 +248,7 @@ public class EntryXmlModule : IConfigModule
             }
             RebuildEntries();
             RebuildPatches();
+            BuildValidNameIndex();
         }
         EditorGUILayout.EndHorizontal();
 
@@ -793,7 +798,13 @@ public class EntryXmlModule : IConfigModule
             // schrijf wijzigingen terug
             if (newName != nameAttr) { p.SetAttributeValue("name", newName); dirty = true; }
             if (newValue != valueAttr) { p.SetAttributeValue("value", newValue); dirty = true; }
-
+            if (string.Equals(newName, "CanPickup", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(newValue, "true", StringComparison.OrdinalIgnoreCase) &&
+                p.Attribute("param1") == null)
+            {
+                p.SetAttributeValue("param1", "");
+                dirty = true;
+            }
 
             if (GUILayout.Button("▲", GUILayout.Width(28))) { MoveSibling(p, -1); }
             if (GUILayout.Button("▼", GUILayout.Width(28))) { MoveSibling(p, +1); }
@@ -840,9 +851,70 @@ public class EntryXmlModule : IConfigModule
             // overige attributen (param1 etc.)
             foreach (var attr in p.Attributes().Where(a => a.Name != "name" && a.Name != "value").ToList())
             {
+                bool isCanPickupParam1 =
+                    string.Equals(newName, "CanPickup", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(attr.Name.LocalName, "param1", StringComparison.OrdinalIgnoreCase);
+
+                if (isCanPickupParam1)
+                {
+                    // Als leeg, zet éénmalig default naar eigen entry-naam (failsafe)
+                    if (string.IsNullOrEmpty(attr.Value))
+                    {
+                        string own = parent?.Attribute("name")?.Value ?? "";
+                        if (!string.IsNullOrEmpty(own))
+                        {
+                            p.SetAttributeValue(attr.Name, own);
+                            dirty = true;
+                        }
+                    }
+
+                    EditorGUILayout.BeginHorizontal();
+
+                    string currentParam = p.Attribute("param1")?.Value ?? "";
+                    bool known = string.IsNullOrEmpty(currentParam) || _knownNames.Contains(currentParam);
+
+                    var prev = GUI.color;
+                    if (!known) GUI.color = Color.red;
+
+                    string newParam = EditorGUILayout.TextField("param1", currentParam, GUILayout.ExpandWidth(true));
+                    GUI.color = prev;
+
+                    // Quick set naar eigen naam
+                    if (GUILayout.Button("Use entry name", GUILayout.Width(120)))
+                    {
+                        string own = parent?.Attribute("name")?.Value ?? "";
+                        if (!string.IsNullOrEmpty(own)) newParam = own;
+                    }
+
+                    // Snelle, gefilterde picker
+                    if (GUILayout.Button("Pick…", GUILayout.Width(60)))
+                    {
+                        string picked = FastNamePicker.Show(
+                            title: "Pick item/block",
+                            subtitle: "Type om te filteren • max 200 per pagina",
+                            allNames: _knownNamesArr,
+                            isItem: s => _knownItems.Contains(s),
+                            isBlock: s => _knownBlocks.Contains(s),
+                            prefill: newParam
+                        );
+                        if (!string.IsNullOrEmpty(picked)) newParam = picked;
+                    }
+
+                    if (newParam != currentParam) { p.SetAttributeValue(attr.Name, newParam); dirty = true; }
+
+                    EditorGUILayout.EndHorizontal();
+
+                    if (!known && !string.IsNullOrEmpty(newParam))
+                        EditorGUILayout.HelpBox("Naam niet gevonden in base game of huidige mod.", MessageType.Warning);
+
+                    continue; // skip default rendering
+                }
+
+                // default rendering voor andere attributen
                 string newVal = EditorGUILayout.TextField(attr.Name.LocalName, attr.Value);
                 if (newVal != attr.Value) { p.SetAttributeValue(attr.Name, newVal); dirty = true; }
             }
+
 
             EditorGUILayout.EndVertical();
         }
@@ -1662,5 +1734,63 @@ public class EntryXmlModule : IConfigModule
         return style;
     }
 
+    void BuildValidNameIndex()
+    {
+        _knownNames.Clear();
+        _knownItems.Clear();
+        _knownBlocks.Clear();
+
+        void AddFromFileSafe(string path, string tag)
+        {
+            try
+            {
+                if (!File.Exists(path)) return;
+                var xd = XDocument.Load(path);
+                foreach (var e in xd.Root?.Elements(tag) ?? Enumerable.Empty<XElement>())
+                {
+                    var n = (string?)e.Attribute("name");
+                    if (string.IsNullOrWhiteSpace(n)) continue;
+                    if (tag == "item") _knownItems.Add(n);
+                    else if (tag == "block") _knownBlocks.Add(n);
+                    _knownNames.Add(n);
+                }
+            }
+            catch { /* negeer parse errors */ }
+        }
+
+        // Base game
+        if (!string.IsNullOrEmpty(ctx?.GameConfigPath))
+        {
+            AddFromFileSafe(Path.Combine(ctx.GameConfigPath, "items.xml"), "item");
+            AddFromFileSafe(Path.Combine(ctx.GameConfigPath, "blocks.xml"), "block");
+        }
+
+        // Eigen mod
+        if (!string.IsNullOrEmpty(ctx?.ModConfigPath))
+        {
+            AddFromFileSafe(Path.Combine(ctx.ModConfigPath, "items.xml"), "item");
+            AddFromFileSafe(Path.Combine(ctx.ModConfigPath, "blocks.xml"), "block");
+        }
+
+        // Huidig in-memory doc meenemen
+        try
+        {
+            foreach (var e in doc?.Descendants() ?? Enumerable.Empty<XElement>())
+            {
+                if (e.Attribute("name") == null) continue;
+                if (e.Name.LocalName is "item" or "block")
+                {
+                    var n = (string?)e.Attribute("name");
+                    if (string.IsNullOrWhiteSpace(n)) continue;
+                    if (e.Name.LocalName == "item") _knownItems.Add(n);
+                    else _knownBlocks.Add(n);
+                    _knownNames.Add(n);
+                }
+            }
+        }
+        catch { }
+
+        _knownNamesArr = _knownNames.OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
 
 }
