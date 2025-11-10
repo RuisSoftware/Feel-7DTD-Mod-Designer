@@ -24,3 +24,9 @@ With the mod designer tool you can manage mods. Here are some functions:
 
 ## Good to know
 To know which Unity version you have to use, click right mouse button on the 7DaysToDie.exe and click Properties. Then choose details and see "Product version". Something like: 2022.3.62F2. That means that you have to download Unity 2022.3.X
+
+## Known Bugs
+There are several know bugs at the moment. I'm as active as i can updating this.
+
+# Spread the word!
+Please help me reach more developers. Share this repo with your fellow developers/server owner to help me bringing these tools to more people.
