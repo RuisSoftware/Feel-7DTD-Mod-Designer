@@ -28,5 +28,8 @@ To know which Unity version you have to use, click right mouse button on the 7Da
 ## Known Bugs
 There are several know bugs at the moment. I'm as active as i can updating this.
 
+## How to use
+![Preview](https://github.com/RuisSoftware/Feel-7DTD-Mod-Designer/blob/main/Screenshots/How%20to%20use.png?raw=true)
+
 # Spread the word!
 Please help me reach more developers. Share this repo with your fellow developers/server owner to help me bringing these tools to more people.
