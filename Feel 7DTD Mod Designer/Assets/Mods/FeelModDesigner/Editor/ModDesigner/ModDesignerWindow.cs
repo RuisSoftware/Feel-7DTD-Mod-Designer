@@ -39,6 +39,13 @@ public class ModDesignerWindow : EditorWindow
     private float initialLeftWidth = 0f;
     private float initialMouseX = 0f;
 
+    // --- Modules list height (resizable) ---
+    private float modulesListHeight = 220f;
+    private bool draggingModulesHeight = false;
+    private float modulesHeightStart = 220f;
+    private float modulesMouseStartY = 0f;
+
+
 
     void BuildModulesList()
     {
@@ -116,6 +123,7 @@ public class ModDesignerWindow : EditorWindow
         gameConfigPath = EditorPrefs.GetString("MD_gameConfigPath", gameConfigPath);
         rootModsFolder = EditorPrefs.GetString("MD_rootModsFolder", rootModsFolder);
         exportModsFolder = EditorPrefs.GetString("MD_exportModsFolder", exportModsFolder);
+        modulesListHeight = EditorPrefs.GetFloat("MD_modulesListHeight", 220f);
 
         BuildModulesList();
         RefreshModList();
@@ -125,6 +133,7 @@ public class ModDesignerWindow : EditorWindow
     void OnDisable()
     {
         // Save paths to EditorPrefs
+        EditorPrefs.SetFloat("MD_modulesListHeight", modulesListHeight);
         EditorPrefs.SetString("MD_gameConfigPath", gameConfigPath);
         EditorPrefs.SetString("MD_rootModsFolder", rootModsFolder);
         EditorPrefs.SetString("MD_exportModsFolder", exportModsFolder);
@@ -290,11 +299,12 @@ public class ModDesignerWindow : EditorWindow
             EditorGUILayout.LabelField("Config:", mod.ConfigFolder, EditorStyles.miniLabel);
             GUILayout.Space(6);
 
-            // Module selection list
+            // Module selection list (resizable)
             GUILayout.Label("Modules", EditorStyles.boldLabel);
             var moduleNames = modules.Select(m => m.ModuleName).ToArray();
-            float listHeight = Mathf.Min(moduleNames.Length, 10) * 25f;
-            moduleScroll = GUILayout.BeginScrollView(moduleScroll, GUILayout.Height(listHeight));
+            modulesListHeight = Mathf.Clamp(modulesListHeight, 80f, Mathf.Max(120f, rect.height - 300f)); // sane bounds per layout
+            moduleScroll = GUILayout.BeginScrollView(moduleScroll, GUILayout.Height(modulesListHeight));
+
             for (int i = 0; i < modules.Count; i++)
             {
                 string name = modules[i].ModuleName;
@@ -306,6 +316,41 @@ public class ModDesignerWindow : EditorWindow
                 GUI.color = oldColor;
             }
             GUILayout.EndScrollView();
+            // Draggable splitter for "Modules" height
+            Rect modulesSplitterRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(4), GUILayout.ExpandWidth(true));
+            EditorGUI.DrawRect(new Rect(modulesSplitterRect.x, modulesSplitterRect.y + modulesSplitterRect.height / 2f - 1f, modulesSplitterRect.width, 2f),
+                               new Color(1f, 0.5f, 0f, 0.6f));
+            EditorGUIUtility.AddCursorRect(modulesSplitterRect, MouseCursor.ResizeVertical);
+
+            if (Event.current.type == EventType.MouseDown && modulesSplitterRect.Contains(Event.current.mousePosition))
+            {
+                draggingModulesHeight = true;
+                modulesHeightStart = modulesListHeight;
+                modulesMouseStartY = GUIUtility.GUIToScreenPoint(Event.current.mousePosition).y;
+                Event.current.Use();
+            }
+            if (draggingModulesHeight && Event.current.type == EventType.MouseDrag)
+            {
+                float curY = GUIUtility.GUIToScreenPoint(Event.current.mousePosition).y;
+                float delta = curY - modulesMouseStartY;
+
+                // Max hoogte afhankelijk van beschikbare ruimte in het rechterpaneel
+                float maxH = Mathf.Max(120f, rect.height - 300f);
+                modulesListHeight = Mathf.Clamp(modulesHeightStart + delta, 80f, maxH);
+
+                Repaint();
+                Event.current.Use();
+            }
+            if (draggingModulesHeight && Event.current.type == EventType.MouseUp)
+            {
+                draggingModulesHeight = false;
+                // Optioneel meteen persistenter maken
+                EditorPrefs.SetFloat("MD_modulesListHeight", modulesListHeight);
+                Event.current.Use();
+            }
+
+            GUILayout.Space(6);
+
             GUILayout.Space(6);
 
             // Prompt to create missing config file for selected module
