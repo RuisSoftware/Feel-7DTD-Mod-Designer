@@ -765,11 +765,35 @@ public class EntryXmlModule : IConfigModule
             string nameAttr = p.Attribute("name")?.Value ?? "";
             string valueAttr = p.Attribute("value")?.Value ?? "";
 
+            // -- linkerveld: property-naam
             string newName = EditorGUILayout.TextField(nameAttr, GUILayout.MinWidth(120));
-            string newValue = EditorGUILayout.TextField(valueAttr);
 
+            // Bepaal of dit een tint-property is (gebruik de actuele invoernaam)
+            bool isTintProp =
+                string.Equals(newName, "CustomIconTint", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(newName, "TintColor", StringComparison.OrdinalIgnoreCase);
+
+            // -- waardev feld: met gekleurde tekst indien hex kleur
+            string newValue;
+            if (isTintProp && TryParseHtmlColor(valueAttr, out var tintCol))
+            {
+                // kleine kleur-swatch vóór de tekstfield (optioneel, handig in 1 oogopslag)
+                var swRect = GUILayoutUtility.GetRect(18, 18, GUILayout.Width(18), GUILayout.Height(18));
+                EditorGUI.DrawRect(swRect, tintCol);
+
+                // gekleurde textfield
+                var tintedStyle = MakeTintedTextFieldStyle(tintCol);
+                newValue = EditorGUILayout.TextField(valueAttr, tintedStyle);
+            }
+            else
+            {
+                newValue = EditorGUILayout.TextField(valueAttr);
+            }
+
+            // schrijf wijzigingen terug
             if (newName != nameAttr) { p.SetAttributeValue("name", newName); dirty = true; }
             if (newValue != valueAttr) { p.SetAttributeValue("value", newValue); dirty = true; }
+
 
             if (GUILayout.Button("▲", GUILayout.Width(28))) { MoveSibling(p, -1); }
             if (GUILayout.Button("▼", GUILayout.Width(28))) { MoveSibling(p, +1); }
@@ -1613,6 +1637,30 @@ public class EntryXmlModule : IConfigModule
         return false;
     }
 
+    // === Color helpers ===
+    bool TryParseHtmlColor(string s, out Color c)
+    {
+        c = default;
+        if (string.IsNullOrWhiteSpace(s)) return false;
+        s = s.Trim();
+        if (!s.StartsWith("#")) s = "#" + s;          // sta ook "RRGGBB" toe
+                                                      // Unity accepteert #RGB, #RRGGBB, #RRGGBBAA
+        return ColorUtility.TryParseHtmlString(s, out c);
+    }
+
+    GUIStyle MakeTintedTextFieldStyle(Color c)
+    {
+        var style = new GUIStyle(EditorStyles.textField);
+        style.normal.textColor = c;
+        style.focused.textColor = c;
+        style.active.textColor = c;
+        style.hover.textColor = c;
+        style.onNormal.textColor = c;
+        style.onFocused.textColor = c;
+        style.onActive.textColor = c;
+        style.onHover.textColor = c;
+        return style;
+    }
 
 
 }
