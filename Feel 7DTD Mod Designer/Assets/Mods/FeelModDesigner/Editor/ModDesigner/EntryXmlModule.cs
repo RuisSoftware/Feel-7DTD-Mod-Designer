@@ -66,6 +66,30 @@ public class EntryXmlModule : IConfigModule
     const float DEFAULT_YAW = 45f;
     const float DEFAULT_PITCH = 25f;
 
+    // === Icon cache (reduceert disk-I/O en repaints) ===
+    static readonly System.Collections.Generic.Dictionary<string, Texture2D> _iconTexCache =
+        new(System.StringComparer.OrdinalIgnoreCase);
+    static readonly System.Collections.Generic.Dictionary<string, string> _iconOriginCache =
+        new(System.StringComparer.OrdinalIgnoreCase);
+    static readonly System.Collections.Generic.HashSet<string> _iconMissingCache =
+        new(System.StringComparer.OrdinalIgnoreCase);
+
+    void ClearIconCache(string name = null)
+    {
+        if (string.IsNullOrEmpty(name))
+        {
+            _iconTexCache.Clear();
+            _iconOriginCache.Clear();
+            _iconMissingCache.Clear();
+        }
+        else
+        {
+            _iconTexCache.Remove(name);
+            _iconOriginCache.Remove(name);
+            _iconMissingCache.Remove(name);
+        }
+    }
+
     public bool HasNoEntries
     {
         get { return entries == null || entries.Count == 0; }
@@ -956,6 +980,7 @@ public class EntryXmlModule : IConfigModule
 
         // Eventueel localization/icon-props wegschrijven
         Save();
+        ClearIconCache();
 
         string summary =
             $"Total: {targets.Count}\n" +
@@ -1736,6 +1761,7 @@ public class EntryXmlModule : IConfigModule
             iconProp.SetAttributeValue("value", iconName);
         }
 
+        ClearIconCache(iconName);   // zorg dat preview meteen je nieuwe PNG ziet
         dirty = true;
         AssetDatabase.Refresh();
         EditorUtility.DisplayDialog("Success",
@@ -1937,32 +1963,66 @@ public class EntryXmlModule : IConfigModule
     bool TryFindIconInModAtlas(string iconName, out Texture2D tex, out string usedPath)
     {
         tex = null; usedPath = "";
-        if (ctx?.ModFolder == null) return false;
+        if (ctx?.ModFolder == null || string.IsNullOrEmpty(iconName)) return false;
 
         string atlasDir = Path.Combine(ctx.ModFolder, "XML", "UIAtlases", "ItemIconAtlas");
         if (!Directory.Exists(atlasDir)) return false;
 
-        foreach (var f in Directory.EnumerateFiles(atlasDir))
+        foreach (var ext in _iconExts)
         {
-            var ext = Path.GetExtension(f).ToLowerInvariant();
-            if (!_iconExts.Contains(ext)) continue;
+            string sys = Path.Combine(atlasDir, iconName + ext);
+            if (!File.Exists(sys)) continue;
 
-            if (string.Equals(Path.GetFileNameWithoutExtension(f), iconName, StringComparison.OrdinalIgnoreCase))
+            string assetPath = ModDesignerWindow.SystemPathToAssetPath(sys);
+            if (string.IsNullOrEmpty(assetPath)) continue;
+
+            var t = AssetDatabase.LoadAssetAtPath<Texture2D>(assetPath);
+            if (t != null)
             {
-                string assetPath = ModDesignerWindow.SystemPathToAssetPath(f);
-                if (!string.IsNullOrEmpty(assetPath))
-                {
-                    var t = AssetDatabase.LoadAssetAtPath<Texture2D>(assetPath);
-                    if (t != null)
-                    {
-                        tex = t; usedPath = f;
-                        return true;
-                    }
-                }
+                tex = t;
+                usedPath = sys;
+                return true;
             }
         }
         return false;
     }
+
+    bool TryResolveIconByNameCached(string name, string labelForOrigin, out Texture2D tex, out string origin)
+    {
+        tex = null; origin = "";
+        if (string.IsNullOrEmpty(name)) return false;
+
+        // Cache hits
+        if (_iconTexCache.TryGetValue(name, out tex))
+        {
+            origin = _iconOriginCache.TryGetValue(name, out var o) ? o : labelForOrigin;
+            return true;
+        }
+        if (_iconMissingCache.Contains(name))
+            return false;
+
+        // Probeer mod-atlas
+        if (TryFindIconInModAtlas(name, out tex, out var p1))
+        {
+            _iconTexCache[name] = tex;
+            _iconOriginCache[name] = $"{labelForOrigin} (mod atlas)";
+            origin = _iconOriginCache[name];
+            return true;
+        }
+        // Probeer default ItemIcons
+        if (TryFindIconInDefaultItemIcons(name, out tex, out var p2))
+        {
+            _iconTexCache[name] = tex;
+            _iconOriginCache[name] = $"{labelForOrigin} (default ItemIcons)";
+            origin = _iconOriginCache[name];
+            return true;
+        }
+
+        // Negatief cachen om herhaalde I/O te vermijden
+        _iconMissingCache.Add(name);
+        return false;
+    }
+
 
     Texture2D LoadTextureAbsolute(string file)
     {
@@ -2017,83 +2077,55 @@ public class EntryXmlModule : IConfigModule
     {
         tex = null; origin = "";
 
-        // A) eigen CustomIcon
-        string? iconName = GetCustomIconNameFrom(entry);
+        // A) Expliciete CustomIcon: alleen die naam proberen (geen fallback)
+        string iconName = GetCustomIconNameFrom(entry);
         if (!string.IsNullOrEmpty(iconName))
         {
-            if (TryFindIconInModAtlas(iconName, out tex, out var p1))
-            {
-                origin = $"CustomIcon '{iconName}' (mod atlas)";
-                return true;
-            }
-            // Soms heet het icoon hetzelfde in default ItemIcons
-            if (TryFindIconInDefaultItemIcons(iconName, out tex, out var p2))
-            {
-                origin = $"CustomIcon '{iconName}' (default ItemIcons)";
-                return true;
-            }
+            // Dit voorkomt lag terwijl je een niet-bestaand icoon intikt:
+            return TryResolveIconByNameCached(iconName, $"CustomIcon '{iconName}'", out tex, out origin);
         }
 
-        // B) geërfde CustomIcon via extends-keten (max 8 stappen)
-        string? extTarget = GetExtendsTarget(entry);
-        XDocument? baseDoc = null;
+        // B) Geen CustomIcon -> probeer geërfde CustomIcon via extends-keten (max 8 stappen)
+        string extTarget = GetExtendsTarget(entry);
+        XDocument baseDoc = null;
         int guard = 0;
 
         while (!string.IsNullOrEmpty(extTarget) && guard++ < 8)
         {
-            // 1) Zoek in huidig mod-document
             var parent = FindEntryByName(extTarget, doc);
-
-            // 2) Zo niet, dan in base game config
             if (parent == null && !string.IsNullOrEmpty(ctx?.GameConfigPath))
             {
                 string basePath = Path.Combine(ctx.GameConfigPath, fileName);
                 if (File.Exists(basePath))
-                {
                     baseDoc ??= XDocument.Load(basePath);
-                    parent = FindEntryByName(extTarget, baseDoc);
-                }
+                parent = FindEntryByName(extTarget, baseDoc);
             }
-
             if (parent == null) break;
 
             var parentIcon = GetCustomIconNameFrom(parent);
             if (!string.IsNullOrEmpty(parentIcon))
             {
-                if (TryFindIconInModAtlas(parentIcon, out tex, out var p3))
-                {
-                    origin = $"Inherited '{parentIcon}' from '{extTarget}' (mod atlas)";
+                if (TryResolveIconByNameCached(parentIcon, $"Inherited '{parentIcon}' from '{extTarget}'", out tex, out origin))
                     return true;
-                }
-                if (TryFindIconInDefaultItemIcons(parentIcon, out tex, out var p4))
-                {
-                    origin = $"Inherited '{parentIcon}' from '{extTarget}' (default ItemIcons)";
-                    return true;
-                }
             }
-
-            // volgende schakel opzoeken
             extTarget = GetExtendsTarget(parent);
         }
 
-        // C) default game icon op naam proberen (entry name en evt. iconName)
-        var candidates = new List<string>();
+        // C) Als laatste: default game icon op basis van entry- of extends-naam
+        var candidates = new System.Collections.Generic.List<string>();
         var selfName = entry.Attribute("name")?.Value;
         if (!string.IsNullOrEmpty(selfName)) candidates.Add(selfName);
-        if (!string.IsNullOrEmpty(iconName)) candidates.Add(iconName);
         if (!string.IsNullOrEmpty(extTarget)) candidates.Add(extTarget);
 
-        foreach (var n in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
+        foreach (var n in candidates.Distinct(System.StringComparer.OrdinalIgnoreCase))
         {
-            if (TryFindIconInDefaultItemIcons(n, out tex, out var p5))
-            {
-                origin = $"Default game icon '{n}'";
+            if (TryResolveIconByNameCached(n, $"Default game icon '{n}'", out tex, out origin))
                 return true;
-            }
         }
 
         return false;
     }
+
 
     // === Color helpers ===
     bool TryParseHtmlColor(string s, out Color c)
