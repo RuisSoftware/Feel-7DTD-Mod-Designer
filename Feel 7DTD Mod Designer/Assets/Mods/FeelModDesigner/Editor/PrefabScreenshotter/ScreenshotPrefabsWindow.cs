@@ -8,6 +8,8 @@ public class ScreenshotPrefabsWindow : EditorWindow
     private string prefabFolder = "Assets/Mods/Root/feel-pokemon/Prefabs";
     private string outputFolder = "Assets/Mods/Root/feel-pokemon/XML/UIAtlases/ItemIconAtlas";
     private int iconSize = 512;
+    private float yawDeg = 45f;   // 0..360
+    private float pitchDeg = 25f; // -89..89 is veilig
 
     // —————— MENU: opent nu een EditorWindow ——————
     [MenuItem("Tools/Feel 7DTD/Prefab Screenshotter")]
@@ -58,6 +60,15 @@ public class ScreenshotPrefabsWindow : EditorWindow
         EditorGUILayout.Space();
 
         iconSize = EditorGUILayout.IntSlider("Icon size (px)", iconSize, 64, 1024);
+
+        yawDeg = EditorGUILayout.Slider("Yaw (°)", yawDeg, 0f, 360f);
+        pitchDeg = EditorGUILayout.Slider("Pitch (°)", pitchDeg, -89f, 89f);
+
+        EditorGUILayout.BeginHorizontal();
+        if (GUILayout.Button("Preset: Front/Right")) { yawDeg = 45f; pitchDeg = 25f; }
+        if (GUILayout.Button("Preset: Front/Left")) { yawDeg = 315f; pitchDeg = 25f; } // of -45°
+        EditorGUILayout.EndHorizontal();
+
 
         EditorGUILayout.Space();
 
@@ -130,7 +141,7 @@ public class ScreenshotPrefabsWindow : EditorWindow
                     prefab.name + " (" + (i + 1) + "/" + prefabGuids.Length + ")",
                     progress);
 
-                ScreenshotPrefabs.TryMakePrefabIcon(prefab, savePath, iconSize);
+                ScreenshotPrefabs.TryMakePrefabIcon(prefab, savePath, iconSize, yawDeg, pitchDeg);
             }
         }
         finally

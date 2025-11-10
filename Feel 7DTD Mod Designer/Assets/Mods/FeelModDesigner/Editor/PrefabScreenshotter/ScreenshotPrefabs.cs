@@ -9,13 +9,13 @@ public class ScreenshotPrefabs
     /// Maakt een écht transparante (RGBA) 1:1 icon-screenshot van een prefab en slaat op als PNG.
     /// Gebruikt black/white matte compositing voor perfecte alpha (geen grijze randen).
     /// </summary>
-    public static bool TryMakePrefabIcon(GameObject prefab, string savePath, int size = 512)
+    public static bool TryMakePrefabIcon(GameObject prefab, string savePath, int size = 512, float yawDeg = 45f, float pitchDeg = 25f)
     {
         if (prefab == null) return false;
 
         // 1) Render twee keer met verschillende achtergronden
-        var texBlack = RenderPrefabWithBG(prefab, size, Color.black);
-        var texWhite = RenderPrefabWithBG(prefab, size, Color.white);
+        var texBlack = RenderPrefabWithBG(prefab, size, Color.black, yawDeg, pitchDeg);
+        var texWhite = RenderPrefabWithBG(prefab, size, Color.white, yawDeg, pitchDeg);
         if (texBlack == null || texWhite == null)
         {
             Cleanup(texBlack);
@@ -57,14 +57,12 @@ public class ScreenshotPrefabs
     }
 
     // ----------------- Kern: render met vaste camera en lights -----------------
-    static Texture2D RenderPrefabWithBG(GameObject prefab, int size, Color bg)
+    static Texture2D RenderPrefabWithBG(GameObject prefab, int size, Color bg, float yawDeg, float pitchDeg)
     {
-        // Hidden scene objects
         var root = new GameObject("~IconRoot") { hideFlags = HideFlags.HideAndDontSave };
         GameObject instance = null;
         Camera cam = null;
         Light key = null, fill = null;
-
         RenderTexture rt = null;
         Texture2D outTex = null;
 
@@ -73,11 +71,9 @@ public class ScreenshotPrefabs
             instance = GameObject.Instantiate(prefab, root.transform);
             instance.hideFlags = HideFlags.HideAndDontSave;
 
-            // Bepaal bounds van renderers
             var rends = instance.GetComponentsInChildren<Renderer>();
             if (rends == null || rends.Length == 0)
             {
-                // Geen renderers -> maak iets minimaal zodat camera iets ziet
                 var cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
                 cube.transform.SetParent(instance.transform, false);
                 cube.hideFlags = HideFlags.HideAndDontSave;
@@ -87,57 +83,55 @@ public class ScreenshotPrefabs
             Bounds b = new Bounds(rends[0].bounds.center, Vector3.zero);
             for (int i = 0; i < rends.Length; i++) b.Encapsulate(rends[i].bounds);
 
-            // Camera
+            // Camera setup
             var camGO = new GameObject("~IconCam") { hideFlags = HideFlags.HideAndDontSave };
             camGO.transform.SetParent(root.transform, false);
             cam = camGO.AddComponent<Camera>();
             cam.clearFlags = CameraClearFlags.SolidColor;
-            cam.backgroundColor = bg;                       // volledig opaak renderen
+            cam.backgroundColor = bg;
             cam.fieldOfView = 30f;
             cam.nearClipPlane = 0.01f;
             cam.farClipPlane = 1000f;
             cam.allowHDR = false;
             cam.allowMSAA = true;
 
-            // Positioneer camera in iso-hoek
-            var viewDir = new Vector3(1, 1, -1).normalized;
-            var radius = b.extents.magnitude;
-            var halfFov = cam.fieldOfView * Mathf.Deg2Rad * 0.5f;
-            var dist = Mathf.Max(0.1f, (radius / Mathf.Tan(halfFov)) * 1.2f);
-            cam.transform.position = b.center + viewDir * dist;
+            // >>> FRONT/RIGHT VIEW <<< 
+            // yaw (Y-as)  = 45°  -> +X (rechts) +Z (voorkant)
+            // pitch (X-as)= ~25° -> licht van boven
+            Vector3 viewDir = Quaternion.Euler(-pitchDeg, yawDeg, 0f) * Vector3.forward;
+
+            float radius = b.extents.magnitude;
+            float halfFov = cam.fieldOfView * Mathf.Deg2Rad * 0.5f;
+            float dist = Mathf.Max(0.1f, (radius / Mathf.Tan(halfFov)) * 1.2f);
+
+            cam.transform.position = b.center + viewDir.normalized * dist;
             cam.transform.LookAt(b.center);
 
-            // Licht
+            // Lights: key ongeveer met camera mee, fill als tegenlicht
             key = new GameObject("~KeyLight").AddComponent<Light>();
             key.hideFlags = HideFlags.HideAndDontSave;
             key.type = LightType.Directional;
             key.intensity = 1.2f;
-            key.transform.rotation = Quaternion.Euler(35, 35, 0);
+            key.transform.rotation = Quaternion.LookRotation(b.center - cam.transform.position) * Quaternion.Euler(10f, -15f, 0f);
 
             fill = new GameObject("~FillLight").AddComponent<Light>();
             fill.hideFlags = HideFlags.HideAndDontSave;
             fill.type = LightType.Directional;
             fill.intensity = 0.6f;
-            fill.transform.rotation = Quaternion.Euler(340, 200, 0);
+            fill.transform.rotation = Quaternion.LookRotation(cam.transform.position - b.center) * Quaternion.Euler(-10f, 180f, 0f);
 
-            // RenderTexture met alpha + MSAA
-            rt = new RenderTexture(size, size, 24, RenderTextureFormat.ARGB32)
-            {
-                antiAliasing = 8
-            };
+            // Render target
+            rt = new RenderTexture(size, size, 24, RenderTextureFormat.ARGB32) { antiAliasing = 8 };
             var prevActive = RenderTexture.active;
             cam.targetTexture = rt;
             RenderTexture.active = rt;
 
-            // Render
             cam.Render();
 
-            // Readback
             outTex = new Texture2D(size, size, TextureFormat.RGBA32, false, false);
             outTex.ReadPixels(new Rect(0, 0, size, size), 0, 0);
             outTex.Apply();
 
-            // Restore
             RenderTexture.active = prevActive;
             cam.targetTexture = null;
 
@@ -153,6 +147,7 @@ public class ScreenshotPrefabs
             if (root != null) GameObject.DestroyImmediate(root);
         }
     }
+
 
     // Zet twee opaak renders (zwart/wit) om naar RGBA met perfecte alpha
     static Texture2D ComposeTransparent(Texture2D black, Texture2D white)
