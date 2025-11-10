@@ -5,6 +5,7 @@ A developer Unity tool to manage 7 Days to Die mods.
 With the mod designer tool you can manage mods. Here are some functions:
 - Shows icons, translations and XML properties all on one place
 - Shows which recipes.xml is using wrong ingredient names (non-existing items)
+- It will automaticly re-build your prefabs into a new .unity3d bundle
 ![Preview](https://github.com/RuisSoftware/Feel-7DTD-Mod-Designer/blob/main/Screenshots/Mod%20Designer%20Patches.png?raw=true)
 ![Preview](https://github.com/RuisSoftware/Feel-7DTD-Mod-Designer/blob/main/Screenshots/Mod%20Designer%20Append.png?raw=true)
 
