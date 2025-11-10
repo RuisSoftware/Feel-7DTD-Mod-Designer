@@ -54,6 +54,18 @@ public class EntryXmlModule : IConfigModule
     HashSet<string> _knownBlocks = new(StringComparer.OrdinalIgnoreCase);
     string[] _knownNamesArr = Array.Empty<string>();
 
+    // Batch icon settings
+    int batchIconSize = 512;
+    float batchYaw = 45f;
+    float batchPitch = 25f;
+    bool batchOverwrite = true;             // bestaande PNG's overschrijven
+    bool batchOnlyWithCustomIcon = true;    // per request: alleen entries met CustomIcon
+                                            
+    // Hardcoded defaults (voor reset-knop)
+    const int DEFAULT_ICON_SIZE = 512;
+    const float DEFAULT_YAW = 45f;
+    const float DEFAULT_PITCH = 25f;
+
     public bool HasNoEntries
     {
         get { return entries == null || entries.Count == 0; }
@@ -569,19 +581,49 @@ public class EntryXmlModule : IConfigModule
             selectedIndex = entries.FindIndex(e => (string?)e.Attribute("name") == newName);
         }
 
-        // --- Icon preview & acties ---
+        // --- Batch: generate icons voor meerdere entries ---
+        GUILayout.BeginVertical("box");
+        GUILayout.Label("Icon generation", EditorStyles.boldLabel);
+
+        batchIconSize = EditorGUILayout.IntSlider("Icon size (px)", batchIconSize, 64, 1024);
         EditorGUILayout.BeginHorizontal();
-        if (GUILayout.Button("📸 Generate/Update CustomIcon from prefab", GUILayout.Height(24)))
+        batchYaw = EditorGUILayout.FloatField("Yaw (°)", batchYaw);
+        batchPitch = EditorGUILayout.FloatField("Pitch (°)", batchPitch);
+
+        // ↺ Reset-knop naar de vooraf gecodeerde defaults
+        if (GUILayout.Button("↺ Reset to defaults (512 / 45° / 25°)", GUILayout.Height(22)))
         {
-            MakeCustomIconFromModel(elEntry);
-        }
-        if (GUILayout.Button("📂 Open Icons Folder", GUILayout.Width(130)))
-        {
-            string atlasDir = Path.Combine(ctx.ModFolder, "XML", "UIAtlases", "ItemIconAtlas");
-            Directory.CreateDirectory(atlasDir);
-            EditorUtility.RevealInFinder(atlasDir);
+            batchIconSize = DEFAULT_ICON_SIZE;
+            batchYaw = DEFAULT_YAW;
+            batchPitch = DEFAULT_PITCH;
+            EditorWindow.focusedWindow?.Repaint();
         }
         EditorGUILayout.EndHorizontal();
+
+        using (new EditorGUI.DisabledGroupScope(doc == null || ctx?.ModFolder == null))
+        {
+            // --- Icon preview & acties ---
+            if (GUILayout.Button("📂 Open Icons Folder", GUILayout.Width(130)))
+            {
+                string atlasDir = Path.Combine(ctx.ModFolder, "XML", "UIAtlases", "ItemIconAtlas");
+                Directory.CreateDirectory(atlasDir);
+                EditorUtility.RevealInFinder(atlasDir);
+            }
+            if (GUILayout.Button("📸 Generate/Update CustomIcon for this prefab", GUILayout.Height(24)))
+            {
+                MakeCustomIconFromModel(elEntry);
+            }
+
+            GUILayout.Label("Batch generation", EditorStyles.boldLabel);
+            batchOverwrite = EditorGUILayout.ToggleLeft("Overwrite existing PNGs", batchOverwrite);
+            batchOnlyWithCustomIcon = EditorGUILayout.ToggleLeft("Only entries with CustomIcon", batchOnlyWithCustomIcon);
+            if (GUILayout.Button("🖼 Batch generate icons for this mod", GUILayout.Height(26)))
+            {
+                GenerateIconsForEntries(batchIconSize, batchYaw, batchPitch, batchOverwrite, batchOnlyWithCustomIcon);
+            }
+        }
+        GUILayout.EndVertical();
+
 
         GUILayout.BeginVertical("box");
         Texture2D preview;
@@ -756,6 +798,121 @@ public class EntryXmlModule : IConfigModule
         if (useArea) GUILayout.EndArea();
     }
 
+    void GenerateIconsForEntries(int size, float yawDeg, float pitchDeg, bool overwrite, bool onlyWithCustomIcon)
+    {
+        if (doc == null || ctx?.ModFolder == null) return;
+
+        string atlasDir = Path.Combine(ctx.ModFolder, "XML", "UIAtlases", "ItemIconAtlas");
+        Directory.CreateDirectory(atlasDir);
+
+        // Verzamel targets
+        var all = doc.Descendants(entryTag).Where(e => e.Attribute("name") != null).ToList();
+        var targets = new List<XElement>();
+        foreach (var e in all)
+        {
+            string iconName = GetCustomIconNameFrom(e) ?? "";
+            if (onlyWithCustomIcon)
+            {
+                if (!string.IsNullOrWhiteSpace(iconName)) targets.Add(e);
+            }
+            else
+            {
+                targets.Add(e);
+            }
+        }
+
+        if (targets.Count == 0)
+        {
+            EditorUtility.DisplayDialog("Batch icons", onlyWithCustomIcon
+                ? "Geen entries met CustomIcon gevonden."
+                : "Geen entries gevonden.", "OK");
+            return;
+        }
+
+        int done = 0, skipped = 0, failed = 0;
+        var sbLog = new System.Text.StringBuilder();
+
+        try
+        {
+            for (int i = 0; i < targets.Count; i++)
+            {
+                var entry = targets[i];
+                string entryName = entry.Attribute("name")?.Value ?? "(unnamed)";
+
+                EditorUtility.DisplayProgressBar("Generating icons", $"{entryName}  ({i + 1}/{targets.Count})", (float)(i + 1) / targets.Count);
+
+                // Prefab vinden via Model-property
+                string prefabName;
+                var prefab = FindPrefabFromModel(entry, out prefabName);
+                if (prefab == null)
+                {
+                    failed++;
+                    sbLog.AppendLine($"[MISS PREFAB] {entryName} (Model niet gevonden)");
+                    continue;
+                }
+
+                // Iconnaam bepalen
+                string iconName = GetCustomIconNameFrom(entry);
+                if (string.IsNullOrWhiteSpace(iconName))
+                {
+                    // Alleen vullen als we niet beperken op 'alleen met CustomIcon'
+                    if (onlyWithCustomIcon)
+                    {
+                        skipped++;
+                        sbLog.AppendLine($"[SKIP NO ICON] {entryName} (geen CustomIcon)");
+                        continue;
+                    }
+                    iconName = entryName; // fallback
+                                          // Schrijf 'm weg zodat UI consistent blijft
+                    entry.Add(new XElement("property", new XAttribute("name", "CustomIcon"), new XAttribute("value", iconName)));
+                    dirty = true;
+                }
+
+                string outPng = Path.Combine(atlasDir, iconName + ".png");
+                if (!overwrite && File.Exists(outPng))
+                {
+                    skipped++;
+                    sbLog.AppendLine($"[SKIP EXISTS] {entryName} -> {iconName}.png");
+                    continue;
+                }
+
+                bool ok = ScreenshotPrefabs.TryMakePrefabIcon(prefab, outPng, size, yawDeg, pitchDeg);
+                if (ok)
+                {
+                    done++;
+                    sbLog.AppendLine($"[OK] {entryName} -> {iconName}.png");
+                }
+                else
+                {
+                    failed++;
+                    sbLog.AppendLine($"[FAIL] {entryName} -> {iconName}.png");
+                }
+            }
+        }
+        finally
+        {
+            EditorUtility.ClearProgressBar();
+        }
+
+        // Eventueel localization/icon-props wegschrijven
+        Save();
+
+        string summary =
+            $"Total: {targets.Count}\n" +
+            $"Generated: {done}\n" +
+            $"Skipped: {skipped}\n" +
+            $"Failed: {failed}\n\n" +
+            $"Icons folder:\n{atlasDir}\n\n" +
+            $"Details:\n{sbLog}";
+
+        // Toon compacte samenvatting; volledige log in console
+        Debug.Log(summary);
+        EditorUtility.DisplayDialog("Batch icons complete", $"Generated: {done}\nSkipped: {skipped}\nFailed: {failed}", "OK");
+
+        // Refresh UI
+        AssetDatabase.Refresh();
+        EditorWindow.focusedWindow?.Repaint();
+    }
 
 
     void DrawPropertyList(List<XElement> list, XElement parent)
@@ -1320,8 +1477,12 @@ public class EntryXmlModule : IConfigModule
             prefabName = Path.GetFileNameWithoutExtension(picked);
         }
 
-        // 2) Determine icon file name (default = entry name)
-        string defaultIconName = entry.Attribute("name")?.Value ?? prefabName ?? prefab.name;
+        // 2) Determine icon file name (default = existing CustomIcon -> entry name)
+        string existingCustom = GetCustomIconNameFrom(entry);
+        string defaultIconName = !string.IsNullOrEmpty(existingCustom)
+            ? existingCustom
+            : (entry.Attribute("name")?.Value ?? prefabName ?? prefab.name);
+
         if (!EditorPrompt.PromptString("Icon file name", "Name (without .png):", defaultIconName, out string iconName))
             return;
 
@@ -1331,7 +1492,22 @@ public class EntryXmlModule : IConfigModule
         string outPng = Path.Combine(atlasDir, iconName + ".png");
 
         // 4) Generate screenshot
-        bool ok = ScreenshotPrefabs.TryMakePrefabIcon(prefab, outPng, 512);
+        // Gebruik de UI-instellingen van deze module (zelfde als batch)
+        int size = Mathf.Clamp(batchIconSize, 32, 2048);
+        float yaw = batchYaw;
+        float pitch = batchPitch;
+
+        // Optioneel: respecteer ook de overwrite toggle van batch (handig en verwacht)
+        if (!batchOverwrite && File.Exists(outPng))
+        {
+            EditorUtility.DisplayDialog("Icon bestaat al",
+                $"'{iconName}.png' bestaat al en 'Overwrite existing PNGs' staat uit.\n" +
+                "Zet Overwrite aan of kies een andere naam.", "OK");
+            return;
+        }
+
+        bool ok = ScreenshotPrefabs.TryMakePrefabIcon(prefab, outPng, size, yaw, pitch);
+
         if (!ok)
         {
             EditorUtility.DisplayDialog("Failed", "Screenshot could not be taken.", "OK");
