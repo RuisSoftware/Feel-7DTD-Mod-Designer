@@ -285,8 +285,8 @@ public class EntryXmlModule : IConfigModule
 
         if (entryTag != null && GUILayout.Button("Import"))
         {
-            if (doc == null && !EnsureDocumentCreated()) { }
-            else { ImportFromBaseGame(); }
+            if (doc == null && !EnsureDocumentCreated()) { /* noop */ }
+            else EditorApplication.delayCall += ImportFromBaseGame;
         }
         GUI.enabled = selectedIndex >= 0 && selectedIndex < entries.Count;
         if (GUILayout.Button("- Delete"))
@@ -564,63 +564,61 @@ public class EntryXmlModule : IConfigModule
             selectedIndex = entries.FindIndex(e => (string?)e.Attribute("name") == newName);
         }
 
-        XElement iconProp = elEntry.Elements("property")
-                          .FirstOrDefault(p => (string)p.Attribute("name") == "CustomIcon");
-        if (iconProp != null)
+        // --- Icon preview & acties ---
+        EditorGUILayout.BeginHorizontal();
+        if (GUILayout.Button("📸 Generate/Update CustomIcon from prefab", GUILayout.Height(24)))
         {
-            EditorGUILayout.BeginHorizontal();
-            if (GUILayout.Button("📸 Generate/Update CustomIcon from prefab", GUILayout.Height(24)))
-            {
-                MakeCustomIconFromModel(elEntry);
-            }
-            if (GUILayout.Button("📂 Open Icons Folder", GUILayout.Width(130)))
-            {
-                string atlasDir = Path.Combine(ctx.ModFolder, "XML", "UIAtlases", "ItemIconAtlas");
-                Directory.CreateDirectory(atlasDir);
-                EditorUtility.RevealInFinder(atlasDir);
-            }
-            EditorGUILayout.EndHorizontal();
+            MakeCustomIconFromModel(elEntry);
+        }
+        if (GUILayout.Button("📂 Open Icons Folder", GUILayout.Width(130)))
+        {
+            string atlasDir = Path.Combine(ctx.ModFolder, "XML", "UIAtlases", "ItemIconAtlas");
+            Directory.CreateDirectory(atlasDir);
+            EditorUtility.RevealInFinder(atlasDir);
+        }
+        EditorGUILayout.EndHorizontal();
 
-            GUILayout.BeginVertical("box");
-            string iconName = iconProp.Attribute("value")?.Value;
-            if (!string.IsNullOrEmpty(iconName))
-            {
-                string atlasPath = Path.Combine(ctx.ModFolder, "XML", "UIAtlases", "ItemIconAtlas");
-                Texture2D iconTexture = null;
-                if (Directory.Exists(atlasPath))
-                {
-                    string[] files = Directory.GetFiles(atlasPath, "*.*");
-                    foreach (string file in files)
-                    {
-                        string ext = Path.GetExtension(file).ToLower();
-                        if (ext == ".png" || ext == ".jpg")
-                        {
-                            string fileNameNoExt = Path.GetFileNameWithoutExtension(file);
-                            if (fileNameNoExt.Equals(iconName, StringComparison.OrdinalIgnoreCase))
-                            {
-                                string assetPath = ModDesignerWindow.SystemPathToAssetPath(file);
-                                iconTexture = AssetDatabase.LoadAssetAtPath<Texture2D>(assetPath);
-                                break;
-                            }
-                        }
-                    }
-                }
+        GUILayout.BeginVertical("box");
+        Texture2D preview;
+        string iconOrigin;
+        bool hasIcon = TryResolveIconForEntry(elEntry, out preview, out iconOrigin);
 
-                if (iconTexture != null)
-                {
-                    EditorGUILayout.LabelField("Custom Icon Preview:");
-                    GUILayout.Label(iconTexture, GUILayout.Width(80), GUILayout.Height(80));
-                }
-                else
-                {
-                    EditorGUILayout.LabelField("No Custom Icon found:", iconName);
-                }
-            }
-            GUILayout.EndVertical();
+        if (hasIcon && preview != null)
+        {
+            EditorGUILayout.LabelField($"Icon Preview  ({iconOrigin})");
+            GUILayout.Label(preview, GUILayout.Width(80), GUILayout.Height(80));
+        }
+        else
+        {
+            EditorGUILayout.LabelField("Icon Preview");
+            EditorGUILayout.HelpBox(
+                "Geen icon gevonden. Maak een CustomIcon via 📸 of plaats een icon in je mod atlas (XML/UIAtlases/ItemIconAtlas), "
+                + "of gebruik een base-game icon in Data/ItemIcons.", MessageType.Info);
         }
 
-        if (GUILayout.Button("▲", GUILayout.Width(28))) MoveEntry(-1);
-        if (GUILayout.Button("▼", GUILayout.Width(28))) MoveEntry(+1);
+        // Toon/maak eventueel de CustomIcon property om snel te kunnen zetten
+        var iconProp = elEntry.Elements("property").FirstOrDefault(p => (string?)p.Attribute("name") == "CustomIcon");
+        string curIconName = iconProp?.Attribute("value")?.Value ?? "";
+        string newIconName = EditorGUILayout.TextField("CustomIcon", curIconName);
+        if (newIconName != curIconName)
+        {
+            if (iconProp == null)
+            {
+                iconProp = new XElement("property",
+                    new XAttribute("name", "CustomIcon"),
+                    new XAttribute("value", newIconName));
+                elEntry.Add(iconProp);
+            }
+            else
+            {
+                iconProp.SetAttributeValue("value", newIconName);
+            }
+            dirty = true;
+        }
+        GUILayout.EndVertical();
+
+        //if (GUILayout.Button("▲", GUILayout.Width(28))) MoveEntry(-1);
+        //if (GUILayout.Button("▼", GUILayout.Width(28))) MoveEntry(+1);
         EditorGUILayout.EndHorizontal();
 
         GUILayout.Space(6);
@@ -1435,6 +1433,186 @@ public class EntryXmlModule : IConfigModule
         // fallback
         return doc.Root;
     }
+
+    // === Icon helpers ===
+    static readonly string[] _iconExts = new[] { ".png", ".jpg", ".jpeg" };
+
+    string? GetCustomIconNameFrom(XElement e)
+    {
+        return e.Elements("property")
+                .FirstOrDefault(p => (string?)p.Attribute("name") == "CustomIcon")
+                ?.Attribute("value")?.Value;
+    }
+
+    string? GetExtendsTarget(XElement entry)
+    {
+        // 7DTD gebruikt meestal het attribuut 'extends'; fallback property desnoods
+        return (string?)entry.Attribute("extends")
+            ?? entry.Elements("property").FirstOrDefault(p => (string?)p.Attribute("name") == "Extends")
+                  ?.Attribute("value")?.Value;
+    }
+
+    bool TryFindIconInModAtlas(string iconName, out Texture2D tex, out string usedPath)
+    {
+        tex = null; usedPath = "";
+        if (ctx?.ModFolder == null) return false;
+
+        string atlasDir = Path.Combine(ctx.ModFolder, "XML", "UIAtlases", "ItemIconAtlas");
+        if (!Directory.Exists(atlasDir)) return false;
+
+        foreach (var f in Directory.EnumerateFiles(atlasDir))
+        {
+            var ext = Path.GetExtension(f).ToLowerInvariant();
+            if (!_iconExts.Contains(ext)) continue;
+
+            if (string.Equals(Path.GetFileNameWithoutExtension(f), iconName, StringComparison.OrdinalIgnoreCase))
+            {
+                string assetPath = ModDesignerWindow.SystemPathToAssetPath(f);
+                if (!string.IsNullOrEmpty(assetPath))
+                {
+                    var t = AssetDatabase.LoadAssetAtPath<Texture2D>(assetPath);
+                    if (t != null)
+                    {
+                        tex = t; usedPath = f;
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    Texture2D LoadTextureAbsolute(string file)
+    {
+        var data = File.ReadAllBytes(file);
+        var t = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+        t.LoadImage(data);
+        t.name = Path.GetFileNameWithoutExtension(file);
+        t.hideFlags = HideFlags.DontSaveInEditor | HideFlags.DontSaveInBuild;
+        return t;
+    }
+
+    bool TryFindIconInDefaultItemIcons(string iconName, out Texture2D tex, out string usedPath)
+    {
+        tex = null; usedPath = "";
+
+        // 1) Afleiden vanaf GameConfigPath → .../Data/ItemIcons
+        var dirs = new List<string>();
+        if (!string.IsNullOrEmpty(ctx?.GameConfigPath))
+        {
+            var dataDir = Directory.GetParent(ctx.GameConfigPath);
+            if (dataDir != null)
+                dirs.Add(Path.Combine(dataDir.FullName, "ItemIcons"));
+        }
+
+        // 2) Hardcoded Steam-locaties als fallback
+        dirs.Add(@"C:\Program Files (x86)\Steam\steamapps\common\7 Days To Die\Data\ItemIcons");
+        dirs.Add(@"C:\Program Files\Steam\steamapps\common\7 Days To Die\Data\ItemIcons");
+
+        foreach (var dir in dirs.Distinct().Where(Directory.Exists))
+        {
+            foreach (var ext in _iconExts)
+            {
+                string p = Path.Combine(dir, iconName + ext);
+                if (File.Exists(p))
+                {
+                    tex = LoadTextureAbsolute(p);
+                    usedPath = p;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    XElement? FindEntryByName(string name, XDocument docLike)
+    {
+        return docLike?.Descendants(entryTag)
+                       .FirstOrDefault(e => string.Equals((string?)e.Attribute("name"), name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    bool TryResolveIconForEntry(XElement entry, out Texture2D tex, out string origin)
+    {
+        tex = null; origin = "";
+
+        // A) eigen CustomIcon
+        string? iconName = GetCustomIconNameFrom(entry);
+        if (!string.IsNullOrEmpty(iconName))
+        {
+            if (TryFindIconInModAtlas(iconName, out tex, out var p1))
+            {
+                origin = $"CustomIcon '{iconName}' (mod atlas)";
+                return true;
+            }
+            // Soms heet het icoon hetzelfde in default ItemIcons
+            if (TryFindIconInDefaultItemIcons(iconName, out tex, out var p2))
+            {
+                origin = $"CustomIcon '{iconName}' (default ItemIcons)";
+                return true;
+            }
+        }
+
+        // B) geërfde CustomIcon via extends-keten (max 8 stappen)
+        string? extTarget = GetExtendsTarget(entry);
+        XDocument? baseDoc = null;
+        int guard = 0;
+
+        while (!string.IsNullOrEmpty(extTarget) && guard++ < 8)
+        {
+            // 1) Zoek in huidig mod-document
+            var parent = FindEntryByName(extTarget, doc);
+
+            // 2) Zo niet, dan in base game config
+            if (parent == null && !string.IsNullOrEmpty(ctx?.GameConfigPath))
+            {
+                string basePath = Path.Combine(ctx.GameConfigPath, fileName);
+                if (File.Exists(basePath))
+                {
+                    baseDoc ??= XDocument.Load(basePath);
+                    parent = FindEntryByName(extTarget, baseDoc);
+                }
+            }
+
+            if (parent == null) break;
+
+            var parentIcon = GetCustomIconNameFrom(parent);
+            if (!string.IsNullOrEmpty(parentIcon))
+            {
+                if (TryFindIconInModAtlas(parentIcon, out tex, out var p3))
+                {
+                    origin = $"Inherited '{parentIcon}' from '{extTarget}' (mod atlas)";
+                    return true;
+                }
+                if (TryFindIconInDefaultItemIcons(parentIcon, out tex, out var p4))
+                {
+                    origin = $"Inherited '{parentIcon}' from '{extTarget}' (default ItemIcons)";
+                    return true;
+                }
+            }
+
+            // volgende schakel opzoeken
+            extTarget = GetExtendsTarget(parent);
+        }
+
+        // C) default game icon op naam proberen (entry name en evt. iconName)
+        var candidates = new List<string>();
+        var selfName = entry.Attribute("name")?.Value;
+        if (!string.IsNullOrEmpty(selfName)) candidates.Add(selfName);
+        if (!string.IsNullOrEmpty(iconName)) candidates.Add(iconName);
+        if (!string.IsNullOrEmpty(extTarget)) candidates.Add(extTarget);
+
+        foreach (var n in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (TryFindIconInDefaultItemIcons(n, out tex, out var p5))
+            {
+                origin = $"Default game icon '{n}'";
+                return true;
+            }
+        }
+
+        return false;
+    }
+
 
 
 }

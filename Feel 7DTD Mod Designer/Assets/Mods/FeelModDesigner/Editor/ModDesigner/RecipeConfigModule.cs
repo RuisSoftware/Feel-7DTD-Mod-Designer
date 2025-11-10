@@ -132,23 +132,23 @@ public class RecipeConfigModule : IConfigModule
             var menu = new GenericMenu();
             menu.AddItem(new GUIContent("New Recipe"), false, () =>
             {
-                if (EditorPrompt.PromptString("New recipe", "Name:", "newRecipe", out var nm))
+                if (doc == null && !EnsureDocumentCreated()) return;
+                if (!EditorPrompt.PromptString("New recipe", "Name:", "newRecipe", out var nm)) return;
+
+                XElement parent = (doc.Root!.Name.LocalName == "recipes")
+                    ? doc.Root
+                    : EnsureAppendParent(doc, "/recipes");
+
+                if (parent.Descendants("recipe").Any(e => (string)e.Attribute("name") == nm))
+                    EditorUtility.DisplayDialog("Already exists", $"Recipe '{nm}' already exists.", "OK");
+                else
                 {
-                    if (doc == null) return;
-                    XElement parent = (doc.Root!.Name.LocalName == "recipes") ? doc.Root : EnsureAppendParent(doc, "/recipes");
-                    if (parent.Descendants("recipe").Any(e => (string)e.Attribute("name") == nm))
-                    {
-                        EditorUtility.DisplayDialog("Already exists", $"Recipe '{nm}' already exists.", "OK");
-                    }
-                    else
-                    {
-                        var el = new XElement("recipe", new XAttribute("name", nm), new XAttribute("count", "1"));
-                        parent.Add(el);
-                        dirty = true;
-                        Rebuild();
-                        selected = recipes.IndexOf(el);
-                        selectedPatch = -1;
-                    }
+                    var el = new XElement("recipe", new XAttribute("name", nm), new XAttribute("count", "1"));
+                    parent.Add(el);
+                    dirty = true;
+                    Rebuild();
+                    selected = recipes.IndexOf(el);
+                    selectedPatch = -1;
                 }
             });
             menu.AddItem(new GUIContent("Append Patch"), false, () =>
@@ -193,7 +193,7 @@ public class RecipeConfigModule : IConfigModule
 
         if (GUILayout.Button("Import"))
         {
-            ImportFromBaseRecipes();
+            EditorApplication.delayCall += () => ImportFromBaseRecipes();
         }
 
         GUI.enabled = selected >= 0 && selected < recipes.Count;
@@ -498,6 +498,7 @@ public class RecipeConfigModule : IConfigModule
     // RecipeConfigModule.cs - updated ImportFromBaseRecipes() function
     void ImportFromBaseRecipes()
     {
+        // 1) Basispad check
         if (ctx == null || string.IsNullOrEmpty(ctx.GameConfigPath))
         {
             EditorUtility.DisplayDialog("Game Config", "Please set the Game Config Folder first.", "OK");
@@ -510,30 +511,75 @@ public class RecipeConfigModule : IConfigModule
             return;
         }
 
+        // 2) Zorg dat ons doeldocument bestaat
+        if (doc == null && !EnsureDocumentCreated()) return;
+        if (doc.Root == null)
+            doc.Add(new XElement("recipes")); // uiterste fallback
+
+        // 3) Basis entries ophalen
         var baseDoc = XDocument.Load(basePath);
-        var baseEntries = baseDoc.Descendants("recipe").Where(e => e.Attribute("name") != null).ToList();
-        var names = baseEntries.Select(e => (string)e.Attribute("name")).OrderBy(s => s).ToArray();
+        var baseEntries = baseDoc.Descendants("recipe")
+            .Where(e => e.Attribute("name") != null)
+            .ToList();
+        var names = baseEntries.Select(e => (string)e.Attribute("name"))
+            .OrderBy(s => s)
+            .ToArray();
         if (names.Length == 0)
         {
             EditorUtility.DisplayDialog("No entries", "No <recipe> entries found in recipes.xml.", "OK");
             return;
         }
 
+        // 4) Pick + kopiëren
         int pickIndex = EntryXmlModule.SimpleListPicker.Show("Import from base game", "Choose a recipe to copy", names);
         if (pickIndex < 0) return;
         string nm = names[pickIndex];
         var src = baseEntries.First(e => (string?)e.Attribute("name") == nm);
 
-        XElement parent = (doc!.Root!.Name.LocalName == "recipes") ? doc.Root : EnsureAppendParent(doc, "/recipes");
+        // Ondersteun zowel <recipes> root als patch-layout (<configs> + append)
+        XElement parent = doc.Root.Name.LocalName.Equals("recipes", StringComparison.OrdinalIgnoreCase)
+            ? doc.Root
+            : EnsureAppendParent(doc, "/recipes");
+
         if (doc.Descendants("recipe").Any(e => (string)e.Attribute("name") == nm))
         {
-            if (!EditorUtility.DisplayDialog("Already exists", $"Recipe '{nm}' already exists in this mod.\nAdd anyway?", "Yes", "No"))
+            if (!EditorUtility.DisplayDialog("Already exists",
+                $"Recipe '{nm}' already exists in this mod.\nAdd anyway?", "Yes", "No"))
                 return;
         }
+
         parent.Add(new XElement(src));
         dirty = true;
         Rebuild();
         selected = recipes.FindIndex(e => (string?)e.Attribute("name") == nm);
+
+        // UI refresh
+        EditorWindow.focusedWindow?.Repaint();
+    }
+
+
+    bool EnsureDocumentCreated()
+    {
+        if (doc != null) return true;
+        if (ctx == null || !ctx.HasValidMod) return false;
+
+        if (string.IsNullOrEmpty(filePath))
+            filePath = Path.Combine(ctx.ModConfigPath, "recipes.xml");
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(filePath) ?? "");
+            doc = new XDocument(new XElement("recipes")); // eenvoudige root
+            doc.Save(filePath);
+            dirty = false;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            EditorUtility.DisplayDialog("Creation failed",
+                $"Could not create recipes.xml:\n{ex.Message}", "OK");
+            return false;
+        }
     }
 
 
