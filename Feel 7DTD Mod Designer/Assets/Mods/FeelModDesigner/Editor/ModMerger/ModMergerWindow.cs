@@ -58,8 +58,8 @@ public class ModMergerWindow : EditorWindow
     [Serializable] class ConflictChoice { public string RelPath, ElementKey; public int SelectedIndex; }
     [Serializable] class ConflictChoiceWrapper { public List<ConflictChoice> items; }
 
-    [MenuItem("Tools/Mod Merger")]
-    public static void ShowWindow() => GetWindow<ModMergerWindow>("Mod Merger");
+    [MenuItem("Tools/Feel 7DTD/Mod Merger")]
+    public static void ShowWindow() => GetWindow<ModMergerWindow>("Feel - Mod Merger");
 
     void OnEnable()
     {

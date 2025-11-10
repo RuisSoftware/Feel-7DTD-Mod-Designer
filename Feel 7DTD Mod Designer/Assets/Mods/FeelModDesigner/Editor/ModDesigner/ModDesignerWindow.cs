@@ -9,8 +9,8 @@ using UnityEngine;
 
 public class ModDesignerWindow : EditorWindow
 {
-    [MenuItem("Tools/7DTD Mod Designer")]
-    public static void ShowWindow() => GetWindow<ModDesignerWindow>("7DTD Mod Designer");
+    [MenuItem("Tools/Feel 7DTD/Mod Designer")]
+    public static void ShowWindow() => GetWindow<ModDesignerWindow>("Feel - Mod Designer");
 
     string gameConfigPath = "Path/To/7DaysToDie/Data/Config";
     string rootModsFolder = "";

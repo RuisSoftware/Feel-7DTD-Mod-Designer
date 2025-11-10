@@ -197,24 +197,4 @@ public class ScreenshotPrefabs
         if (obj == null) return;
         if (obj is Texture2D) Object.DestroyImmediate(obj);
     }
-
-    // —————— BATCH MENU (handig om te testen) ——————
-    [MenuItem("Tools/Take Screenshots of Prefabs")]
-    public static void TakeScreenshots()
-    {
-        const string modName = "VendingMachines";
-        const string folderPath = "Assets/Mods/" + modName + "/Prefabs";
-        const string savePath = "Assets/Mods/" + modName + "/XML/UIAtlases/ItemIconAtlas";
-
-        if (!Directory.Exists(savePath)) Directory.CreateDirectory(savePath);
-
-        var prefabGuids = AssetDatabase.FindAssets("t:Prefab", new[] { folderPath });
-        foreach (var guid in prefabGuids)
-        {
-            var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(AssetDatabase.GUIDToAssetPath(guid));
-            var outFile = Path.Combine(savePath, prefab.name + ".png").Replace("\\", "/");
-            TryMakePrefabIcon(prefab, outFile, 512);
-        }
-        Debug.Log("Transparante icons opgeslagen in " + savePath);
-    }
 }
