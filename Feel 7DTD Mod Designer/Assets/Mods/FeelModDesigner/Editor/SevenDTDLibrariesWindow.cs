@@ -1,29 +1,28 @@
 ﻿using UnityEngine;
 using UnityEditor;
+using System;
 using System.IO;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 
-/// <summary>
-/// Editor window to link 7 Days to Die managed assemblies (DLLs)
-/// into your Unity project via csc.rsp so you can use 7DTD types
-/// directly in C# scripts.
-/// 
-/// What it does now:
-/// - Detects the 7DTD Managed folder (client or server)
-/// - Lets you pick which DLLs to use
-/// - Copies those DLLs into Assets/7DTDLibs/
-/// - Creates Assets/csc.rsp with -r:7DTDLibs/SomeDll.dll lines
-/// </summary>
 public class SevenDTDLibrariesWindow : EditorWindow
 {
     private const string PrefKeyInstallPath = "SevenDTD.InstallPath";
-    private const string LibsFolderName = "7DTDLibs"; // under Assets/
 
     private string installPath;   // User-chosen 7DTD install or Managed folder
     private string managedPath;   // Resolved Managed folder (7DaysToDie_Data/Managed, etc.)
     private bool managedPathValid;
+
+    // Extra folders for mods
+    private string defaultHarmonyModPath; // <gameRoot>/Mods/0_TFP_Harmony
+    private bool defaultHarmonyModExists;
+
+    private string appDataModsPath;       // %APPDATA%/7DaysToDie/Mods
+    private bool appDataModsExists;
+
+    private bool includeDefaultHarmonyMod = true;
+    private bool includeAppDataMods = true;
 
     private Vector2 dllScroll;
 
@@ -51,7 +50,7 @@ public class SevenDTDLibrariesWindow : EditorWindow
     public static void Open()
     {
         var window = GetWindow<SevenDTDLibrariesWindow>("7DTD Libraries");
-        window.minSize = new Vector2(600, 320);
+        window.minSize = new Vector2(650, 360);
         window.Show();
     }
 
@@ -68,10 +67,9 @@ public class SevenDTDLibrariesWindow : EditorWindow
 
         EditorGUILayout.HelpBox(
             "Point this tool to your 7 Days to Die installation folder or directly to the Managed folder.\n" +
-            "It will:\n" +
-            "- Copy selected 7DTD DLLs into Assets/" + LibsFolderName + "/\n" +
-            "- Generate Assets/csc.rsp with references to those DLLs\n\n" +
-            "After that, your C# scripts can reference 7DTD types like GameManager, EntityPlayer, Harmony, etc.",
+            "It will generate an Assets/csc.rsp that references 7DTD DLLs so your C# scripts can use 7DTD types.\n\n" +
+            "Extra: it also looks in the default Mods/0_TFP_Harmony folder and in %APPDATA%/7DaysToDie/Mods\n" +
+            "for additional DLLs (e.g. Harmony mods).",
             MessageType.Info);
 
         EditorGUILayout.Space();
@@ -82,9 +80,12 @@ public class SevenDTDLibrariesWindow : EditorWindow
         DrawManagedPathInfo();
         EditorGUILayout.Space();
 
+        DrawExtraModFolders();
+        EditorGUILayout.Space();
+
         using (new EditorGUI.DisabledGroupScope(!managedPathValid))
         {
-            if (GUILayout.Button("Scan DLLs in Managed folder", GUILayout.Height(24)))
+            if (GUILayout.Button("Scan DLLs in Managed + mod folders", GUILayout.Height(24)))
             {
                 ScanDlls();
             }
@@ -100,7 +101,7 @@ public class SevenDTDLibrariesWindow : EditorWindow
         {
             if (GUILayout.Button("Create / Update Assets/csc.rsp with selected DLLs", GUILayout.Height(28)))
             {
-                CreateOrUpdateRspAndCopyDlls();
+                CreateOrUpdateRsp();
             }
         }
     }
@@ -118,7 +119,7 @@ public class SevenDTDLibrariesWindow : EditorWindow
             {
                 installPath = folder.Replace("\\", "/");
                 EditorPrefs.SetString(PrefKeyInstallPath, installPath);
-                TryResolveManagedPath();
+                TryResolveManagedPath(true);
             }
         }
         EditorGUILayout.EndHorizontal();
@@ -165,17 +166,64 @@ public class SevenDTDLibrariesWindow : EditorWindow
         }
     }
 
+    private void DrawExtraModFolders()
+    {
+        EditorGUILayout.LabelField("Additional mod folders to scan for DLLs", EditorStyles.boldLabel);
+
+        // Default Harmony mod under game root: Mods/0_TFP_Harmony
+        EditorGUILayout.BeginHorizontal();
+        includeDefaultHarmonyMod = EditorGUILayout.Toggle(includeDefaultHarmonyMod, GUILayout.Width(20));
+        EditorGUILayout.LabelField("Include default Harmony mod (Mods/0_TFP_Harmony next to the game)", GUILayout.ExpandWidth(true));
+        EditorGUILayout.EndHorizontal();
+
+        if (defaultHarmonyModExists)
+        {
+            using (new EditorGUI.DisabledGroupScope(true))
+            {
+                EditorGUILayout.TextField(defaultHarmonyModPath);
+            }
+        }
+        else
+        {
+            EditorGUILayout.HelpBox(
+                "Default Harmony mod folder not found next to the game (Mods/0_TFP_Harmony). It will be ignored.",
+                MessageType.Info);
+        }
+
+        EditorGUILayout.Space();
+
+        // AppData mods: %APPDATA%/7DaysToDie/Mods
+        EditorGUILayout.BeginHorizontal();
+        includeAppDataMods = EditorGUILayout.Toggle(includeAppDataMods, GUILayout.Width(20));
+        EditorGUILayout.LabelField("Include AppData mods folder (%APPDATA%/7DaysToDie/Mods)", GUILayout.ExpandWidth(true));
+        EditorGUILayout.EndHorizontal();
+
+        if (appDataModsExists)
+        {
+            using (new EditorGUI.DisabledGroupScope(true))
+            {
+                EditorGUILayout.TextField(appDataModsPath);
+            }
+        }
+        else
+        {
+            EditorGUILayout.HelpBox(
+                "AppData mods folder not found (%APPDATA%/7DaysToDie/Mods). It will be ignored.",
+                MessageType.Info);
+        }
+    }
+
     private void DrawDllList()
     {
         if (!dllsScanned)
         {
-            EditorGUILayout.HelpBox("No scan performed yet. Click 'Scan DLLs in Managed folder' first.", MessageType.None);
+            EditorGUILayout.HelpBox("No scan performed yet. Click 'Scan DLLs in Managed + mod folders' first.", MessageType.None);
             return;
         }
 
         if (foundDlls.Count == 0)
         {
-            EditorGUILayout.HelpBox("No DLLs found in the Managed folder.", MessageType.Warning);
+            EditorGUILayout.HelpBox("No DLLs found in the selected folders.", MessageType.Warning);
             return;
         }
 
@@ -205,7 +253,7 @@ public class SevenDTDLibrariesWindow : EditorWindow
         }
         EditorGUILayout.EndHorizontal();
 
-        dllScroll = EditorGUILayout.BeginScrollView(dllScroll, GUILayout.Height(160));
+        dllScroll = EditorGUILayout.BeginScrollView(dllScroll, GUILayout.Height(180));
         foreach (var dll in foundDlls)
         {
             EditorGUILayout.BeginHorizontal();
@@ -220,7 +268,7 @@ public class SevenDTDLibrariesWindow : EditorWindow
         EditorGUILayout.EndScrollView();
     }
 
-    // ----------------- Logic: resolving Managed folder & scanning DLLs -----------------
+    // ----------------- Logic: resolving Managed + mod folders & scanning DLLs -----------------
 
     private void TryResolveManagedPath(bool showDialogOnFail = false)
     {
@@ -236,16 +284,19 @@ public class SevenDTDLibrariesWindow : EditorWindow
                     "The selected folder does not exist:\n" + installPath,
                     "OK");
             }
+
+            ResolveModFolders(); // clears them
             return;
         }
 
         string path = installPath.Replace("\\", "/");
 
         // 1) User selected the Managed folder directly
-        if (path.EndsWith("/Managed") && Directory.Exists(path))
+        if (path.EndsWith("/Managed", StringComparison.OrdinalIgnoreCase) && Directory.Exists(path))
         {
             managedPath = path;
             managedPathValid = true;
+            ResolveModFolders();
             return;
         }
 
@@ -255,6 +306,7 @@ public class SevenDTDLibrariesWindow : EditorWindow
         {
             managedPath = clientManaged;
             managedPathValid = true;
+            ResolveModFolders();
             return;
         }
 
@@ -264,6 +316,7 @@ public class SevenDTDLibrariesWindow : EditorWindow
         {
             managedPath = serverManaged;
             managedPathValid = true;
+            ResolveModFolders();
             return;
         }
 
@@ -275,6 +328,68 @@ public class SevenDTDLibrariesWindow : EditorWindow
                 "Make sure this is the actual 7DTD installation folder (with 7DaysToDie.exe or 7DaysToDieServer.exe),\n" +
                 "or select the '*_Data/Managed' folder directly.",
                 "OK");
+        }
+
+        ResolveModFolders(); // clears them
+    }
+
+    /// <summary>
+    /// Resolve additional mod folders:
+    /// - Default Harmony mod under game root: Mods/0_TFP_Harmony
+    /// - AppData mods: %APPDATA%/7DaysToDie/Mods
+    /// </summary>
+    private void ResolveModFolders()
+    {
+        defaultHarmonyModPath = null;
+        defaultHarmonyModExists = false;
+        appDataModsPath = null;
+        appDataModsExists = false;
+
+        // From managed path, try to find game root and Mods/0_TFP_Harmony
+        try
+        {
+            if (!string.IsNullOrEmpty(managedPath) && Directory.Exists(managedPath))
+            {
+                var managedDir = new DirectoryInfo(managedPath);
+                var dataDir = managedDir.Parent; // 7DaysToDie_Data or 7DaysToDieServer_Data
+                if (dataDir != null)
+                {
+                    var rootDir = dataDir.Parent; // game root
+                    if (rootDir != null && rootDir.Exists)
+                    {
+                        string modsDir = Path.Combine(rootDir.FullName, "Mods");
+                        string harmonyDir = Path.Combine(modsDir, "0_TFP_Harmony");
+                        if (Directory.Exists(harmonyDir))
+                        {
+                            defaultHarmonyModPath = harmonyDir.Replace("\\", "/");
+                            defaultHarmonyModExists = true;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning("Error while resolving default Harmony mod folder: " + ex.Message);
+        }
+
+        // AppData mods: %APPDATA%/7DaysToDie/Mods
+        try
+        {
+            string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (!string.IsNullOrEmpty(appData))
+            {
+                string modsCandidate = Path.Combine(appData, "7DaysToDie/Mods").Replace("\\", "/");
+                if (Directory.Exists(modsCandidate))
+                {
+                    appDataModsPath = modsCandidate;
+                    appDataModsExists = true;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning("Error while resolving AppData mods folder: " + ex.Message);
         }
     }
 
@@ -295,17 +410,41 @@ public class SevenDTDLibrariesWindow : EditorWindow
 
         try
         {
-            var dllFiles = Directory.GetFiles(managedPath, "*.dll", SearchOption.TopDirectoryOnly);
+            var dllFiles = new List<string>();
+
+            // DLLs from Managed (top-level is enough)
+            if (!string.IsNullOrEmpty(managedPath) && Directory.Exists(managedPath))
+            {
+                dllFiles.AddRange(Directory.GetFiles(managedPath, "*.dll", SearchOption.TopDirectoryOnly));
+            }
+
+            // DLLs from default Harmony mod (recursive)
+            if (includeDefaultHarmonyMod && defaultHarmonyModExists && Directory.Exists(defaultHarmonyModPath))
+            {
+                dllFiles.AddRange(Directory.GetFiles(defaultHarmonyModPath, "*.dll", SearchOption.AllDirectories));
+            }
+
+            // DLLs from AppData mods (recursive)
+            if (includeAppDataMods && appDataModsExists && Directory.Exists(appDataModsPath))
+            {
+                dllFiles.AddRange(Directory.GetFiles(appDataModsPath, "*.dll", SearchOption.AllDirectories));
+            }
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var dllPath in dllFiles)
             {
-                var fileName = Path.GetFileName(dllPath);
+                string normPath = dllPath.Replace("\\", "/");
+                if (!seen.Add(normPath))
+                    continue;
+
+                string fileName = Path.GetFileName(normPath);
                 bool isRecommended = RecommendedDllNames.Contains(fileName);
 
                 foundDlls.Add(new DllInfo
                 {
                     name = fileName,
-                    fullPath = dllPath.Replace("\\", "/"),
+                    fullPath = normPath,
                     selected = isRecommended,
                     recommended = isRecommended
                 });
@@ -323,11 +462,11 @@ public class SevenDTDLibrariesWindow : EditorWindow
             {
                 EditorUtility.DisplayDialog(
                     "No DLLs found",
-                    "No .dll files were found in:\n" + managedPath,
+                    "No .dll files were found in Managed / mod folders.",
                     "OK");
             }
         }
-        catch (System.Exception ex)
+        catch (Exception ex)
         {
             Debug.LogError("Error while scanning DLLs: " + ex);
             EditorUtility.DisplayDialog(
@@ -337,8 +476,8 @@ public class SevenDTDLibrariesWindow : EditorWindow
         }
     }
 
-    // ----------------- csc.rsp generation (no copying, use absolute paths) -----------------
-    private void CreateOrUpdateRspAndCopyDlls()
+    // ----------------- csc.rsp generation (absolute paths, no copying) -----------------
+    private void CreateOrUpdateRsp()
     {
         // Assets/csc.rsp is where Unity expects it
         string assetsPath = Application.dataPath.Replace("\\", "/");
@@ -384,7 +523,7 @@ public class SevenDTDLibrariesWindow : EditorWindow
             File.WriteAllText(rspPath, sb.ToString(), Encoding.UTF8);
             AssetDatabase.Refresh();
         }
-        catch (System.Exception ex)
+        catch (Exception ex)
         {
             Debug.LogError("Error writing csc.rsp: " + ex);
             EditorUtility.DisplayDialog(
@@ -397,10 +536,11 @@ public class SevenDTDLibrariesWindow : EditorWindow
         EditorUtility.DisplayDialog(
             "Done",
             "csc.rsp has been created/updated at:\n" + rspPath + "\n\n" +
-            "The 7DTD DLLs are still in their original location.\n\n" +
             "Unity should now recompile. If IntelliSense still doesn't pick it up,\n" +
-            "go to Unity and choose 'Assets → Open C# Project' to regenerate the .csproj files.",
+            "go to Unity and choose 'Assets → Open C# Project' to regenerate the .csproj files.\n\n" +
+            "Tip: only reference the DLLs you really need (Assembly-CSharp, firstpass, Harmony).\n" +
+            "Adding too many engine/editor DLLs from 7DTD can conflict with Unity's own packages\n" +
+            "like Collaborate / Plastic SCM.",
             "OK");
     }
-
 }
