@@ -588,8 +588,10 @@ public class EntryXmlModule : IConfigModule
         var elEntry = entries[selectedIndex];
         rightScroll = GUILayout.BeginScrollView(rightScroll);
 
-        // Name field and reorder buttons
-        EditorGUILayout.BeginHorizontal();
+
+        GUILayout.BeginVertical("box");
+        // Block Name
+        GUILayout.Label("Base Settings", EditorStyles.boldLabel);
         string nm = elEntry.Attribute("name")?.Value ?? "";
         string newName = EditorGUILayout.TextField($"{entryTag} name", nm);
         if (newName != nm && !string.IsNullOrWhiteSpace(newName))
@@ -624,6 +626,50 @@ public class EntryXmlModule : IConfigModule
             RebuildEntries();
             selectedIndex = entries.FindIndex(e => (string?)e.Attribute("name") == newName);
         }
+
+        // Icon preview
+        Texture2D preview;
+        string iconOrigin;
+        bool hasIcon = TryResolveIconForEntry(elEntry, out preview, out iconOrigin);
+
+        if (hasIcon && preview != null)
+        {
+            EditorGUILayout.LabelField($"Icon Preview  ({iconOrigin})");
+            GUILayout.Label(preview, GUILayout.Width(80), GUILayout.Height(80));
+        }
+        else
+        {
+            EditorGUILayout.LabelField("Icon Preview");
+            EditorGUILayout.HelpBox(
+                "Geen icon gevonden. Maak een CustomIcon via 📸 of plaats een icon in je mod atlas (XML/UIAtlases/ItemIconAtlas), "
+                + "of gebruik een base-game icon in Data/ItemIcons.", MessageType.Info);
+        }
+
+        // Toon/maak eventueel de CustomIcon property om snel te kunnen zetten
+        var iconProp = elEntry.Elements("property").FirstOrDefault(p => (string?)p.Attribute("name") == "CustomIcon");
+        string curIconName = iconProp?.Attribute("value")?.Value ?? "";
+        string newIconName = EditorGUILayout.TextField("CustomIcon", curIconName);
+        if (newIconName != curIconName)
+        {
+            if (iconProp == null)
+            {
+                iconProp = new XElement("property",
+                    new XAttribute("name", "CustomIcon"),
+                    new XAttribute("value", newIconName));
+                elEntry.Add(iconProp);
+            }
+            else
+            {
+                iconProp.SetAttributeValue("value", newIconName);
+            }
+            dirty = true;
+        }
+        GUILayout.EndVertical();
+
+        GUILayout.Space(6);
+
+        // Name field and reorder buttons
+        EditorGUILayout.BeginHorizontal();
 
         // --- Batch: generate icons voor meerdere entries ---
         GUILayout.BeginVertical("box");
@@ -668,51 +714,13 @@ public class EntryXmlModule : IConfigModule
         }
         GUILayout.EndVertical();
 
-
-        GUILayout.BeginVertical("box");
-        Texture2D preview;
-        string iconOrigin;
-        bool hasIcon = TryResolveIconForEntry(elEntry, out preview, out iconOrigin);
-
-        if (hasIcon && preview != null)
-        {
-            EditorGUILayout.LabelField($"Icon Preview  ({iconOrigin})");
-            GUILayout.Label(preview, GUILayout.Width(80), GUILayout.Height(80));
-        }
-        else
-        {
-            EditorGUILayout.LabelField("Icon Preview");
-            EditorGUILayout.HelpBox(
-                "Geen icon gevonden. Maak een CustomIcon via 📸 of plaats een icon in je mod atlas (XML/UIAtlases/ItemIconAtlas), "
-                + "of gebruik een base-game icon in Data/ItemIcons.", MessageType.Info);
-        }
-
-        // Toon/maak eventueel de CustomIcon property om snel te kunnen zetten
-        var iconProp = elEntry.Elements("property").FirstOrDefault(p => (string?)p.Attribute("name") == "CustomIcon");
-        string curIconName = iconProp?.Attribute("value")?.Value ?? "";
-        string newIconName = EditorGUILayout.TextField("CustomIcon", curIconName);
-        if (newIconName != curIconName)
-        {
-            if (iconProp == null)
-            {
-                iconProp = new XElement("property",
-                    new XAttribute("name", "CustomIcon"),
-                    new XAttribute("value", newIconName));
-                elEntry.Add(iconProp);
-            }
-            else
-            {
-                iconProp.SetAttributeValue("value", newIconName);
-            }
-            dirty = true;
-        }
-        GUILayout.EndVertical();
-
         //if (GUILayout.Button("▲", GUILayout.Width(28))) MoveEntry(-1);
         //if (GUILayout.Button("▼", GUILayout.Width(28))) MoveEntry(+1);
         EditorGUILayout.EndHorizontal();
 
         GUILayout.Space(6);
+
+        GUILayout.BeginVertical("box");
 
         // Localization section (only for blocks/items)
         if ((fileName.Equals("blocks.xml", StringComparison.OrdinalIgnoreCase) ||
@@ -774,6 +782,12 @@ public class EntryXmlModule : IConfigModule
             GUILayout.Space(4);
         }
 
+        GUILayout.EndVertical();
+
+        GUILayout.Space(6);
+
+        GUILayout.BeginVertical("box");
+
         // Other child elements
         var others = elEntry.Elements().Where(x => x.Name != "property").ToList();
         if (others.Count > 0)
@@ -834,6 +848,8 @@ public class EntryXmlModule : IConfigModule
             }
         }
         EditorGUILayout.EndHorizontal();
+
+        GUILayout.EndVertical();
 
         GUILayout.Space(10);
         if (GUILayout.Button($"Save {fileName}")) Save();
@@ -1833,8 +1849,8 @@ public class EntryXmlModule : IConfigModule
         if (string.IsNullOrEmpty(descKey))
         {
             EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
-            GUILayout.Label("Geen DescriptionKey gevonden.");
-            if (GUILayout.Button("+ Maak DescriptionKey", GUILayout.Width(180)))
+            GUILayout.Label("No DescriptionKey found.");
+            if (GUILayout.Button("+ Make DescriptionKey", GUILayout.Width(180)))
             {
                 descKey = internalName + "Desc";
                 entry.Add(new XElement("property",
