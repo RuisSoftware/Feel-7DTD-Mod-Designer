@@ -186,23 +186,59 @@ public class EntryXmlModule : IConfigModule
             return;
         }
 
-        var all = doc.Descendants(entryTag)
-                     .Where(e => e.Attribute("name") != null)
-                     .OrderBy(e => (string)e.Attribute("name"))
-                     .ToList();
+        // Bewaar huidige selectie (op element, niet index) zodat selectie stabiel blijft
+        XElement previouslySelected = (selectedIndex >= 0 && selectedIndex < entries.Count)
+            ? entries[selectedIndex]
+            : null;
 
+        // Neem entries in documentvolgorde
+        var all = GetEntriesInDocumentOrder();
+
+        // Filter met behoud van volgorde
         if (string.IsNullOrWhiteSpace(search))
-            entries = all;
+            entries = all.ToList();
         else
         {
             var lc = search.ToLowerInvariant();
             entries = all.Where(e => ((string)e.Attribute("name")).ToLowerInvariant().Contains(lc)).ToList();
         }
 
-        if (entries.Count == 0) selectedIndex = -1;
-        else if (selectedIndex < 0) selectedIndex = 0;
-        else if (selectedIndex >= entries.Count) selectedIndex = entries.Count - 1;
+        // Herstel selectie zo goed mogelijk
+        if (entries.Count == 0)
+        {
+            selectedIndex = -1;
+        }
+        else if (previouslySelected != null)
+        {
+            int idx = entries.IndexOf(previouslySelected);
+            selectedIndex = (idx >= 0) ? idx : Mathf.Clamp(selectedIndex, 0, entries.Count - 1);
+        }
+        else
+        {
+            selectedIndex = Mathf.Clamp(selectedIndex, 0, entries.Count - 1);
+        }
     }
+
+    IEnumerable<XElement> GetEntriesInDocumentOrder()
+    {
+        if (doc?.Root == null || entryTag == null)
+            return Enumerable.Empty<XElement>();
+
+        // 1) Directe root-layout: <blocks> / <items>
+        if (doc.Root.Name.LocalName.Equals(rootTag, StringComparison.OrdinalIgnoreCase))
+            return doc.Root.Elements(entryTag).Where(e => e.Attribute("name") != null);
+
+        // 2) Patch-layout: pak de append-container met xpath="/<rootTag>"
+        var container = doc.Root.Elements("append")
+            .FirstOrDefault(a => string.Equals((string)a.Attribute("xpath"), "/" + rootTag, StringComparison.OrdinalIgnoreCase));
+
+        if (container != null)
+            return container.Elements(entryTag).Where(e => e.Attribute("name") != null);
+
+        // 3) Fallback (zou zelden nodig moeten zijn)
+        return doc.Descendants(entryTag).Where(e => e.Attribute("name") != null);
+    }
+
 
     // ------------------- LIST PANE -------------------
     // EntryXmlModule.cs - updated OnGUIList() function
@@ -453,20 +489,28 @@ public class EntryXmlModule : IConfigModule
     {
         if (selectedIndex < 0 || selectedIndex >= entries.Count) return;
         var el = entries[selectedIndex];
-        if (el == null) return;
+        if (el?.Parent == null) return;
 
-        var siblings = el.Parent.Elements(el.Name).ToList(); // siblings within the same parent
+        var siblings = el.Parent.Elements(el.Name).ToList();
+        if (siblings.Count <= 1) return;
+
         int idx = siblings.IndexOf(el);
         int newIdx = Mathf.Clamp(idx + delta, 0, siblings.Count - 1);
         if (newIdx == idx) return;
 
+        var anchor = siblings[newIdx]; // referentie blijft geldig na Remove()
         el.Remove();
-        if (newIdx >= siblings.Count) el.Parent.Add(el);
-        else siblings[newIdx].AddBeforeSelf(el);
+
+        if (newIdx < idx)  // omhoog
+            anchor.AddBeforeSelf(el);
+        else               // omlaag
+            anchor.AddAfterSelf(el);
 
         dirty = true;
+
         RebuildEntries();
         selectedIndex = entries.IndexOf(el);
+        EditorWindow.focusedWindow?.Repaint();
     }
 
     // ------------------- INSPECTOR PANE -------------------
@@ -1079,14 +1123,25 @@ public class EntryXmlModule : IConfigModule
 
     void MoveSibling(XElement el, int delta)
     {
+        if (el?.Parent == null) return;
+
         var siblings = el.Parent.Elements(el.Name).ToList();
+        if (siblings.Count <= 1) return;
+
         int idx = siblings.IndexOf(el);
         int newIdx = Mathf.Clamp(idx + delta, 0, siblings.Count - 1);
         if (newIdx == idx) return;
+
+        var anchor = siblings[newIdx];
         el.Remove();
-        if (newIdx >= siblings.Count) el.Parent.Add(el);
-        else siblings[newIdx].AddBeforeSelf(el);
+
+        if (newIdx < idx)  // omhoog
+            anchor.AddBeforeSelf(el);
+        else               // omlaag
+            anchor.AddAfterSelf(el);
+
         dirty = true;
+        EditorWindow.focusedWindow?.Repaint();
     }
 
     public void Save()
@@ -1423,30 +1478,169 @@ public class EntryXmlModule : IConfigModule
     {
         prefabName = null;
 
-        // Zoek <property name="Model" value="...?...PrefabName">
-        var modelProp = entry.Elements("property").FirstOrDefault(p => (string)p.Attribute("name") == "Model");
-        var modelVal = modelProp?.Attribute("value")?.Value;
-        if (!string.IsNullOrEmpty(modelVal))
+        // 1) Probeer een model-achtige waarde op dit entry of via extends-keten te vinden
+        string modelVal = ResolveModelValueWithExtends(entry);
+        if (string.IsNullOrEmpty(modelVal))
+            return null;
+
+        // 2) Haal een prefabnaam uit de value (werkt voor "#@modfolder:Resources/Bundle.unity3d?MyPrefab",
+        //    "Assets/.../MyPrefab.prefab", of alleen "MyPrefab")
+        string shortName = ExtractPrefabName(modelVal);
+        if (string.IsNullOrEmpty(shortName))
+            return null;
+
+        prefabName = shortName;
+
+        // 3) Zoek de prefab als asset in het project
+        //    a) Eerst exacte bestandsnaam via name: filter (snelste en meest precies)
+        var exact = AssetDatabase.FindAssets($"t:Prefab name:{shortName}");
+        var pick = PickBestPrefabPath(exact, shortName);
+        if (pick != null) return AssetDatabase.LoadAssetAtPath<GameObject>(pick);
+
+        //    b) Iets ruimer zoeken op tekst
+        var loose = AssetDatabase.FindAssets($"t:Prefab {shortName}");
+        pick = PickBestPrefabPath(loose, shortName);
+        if (pick != null) return AssetDatabase.LoadAssetAtPath<GameObject>(pick);
+
+        // 4) Fallback: handmatig onder de mod/Prefabs map zoeken (filesystem)
+        try
         {
-            var m = Regex.Match(modelVal, @"\?(.+)$"); // alles na '?'
-            if (m.Success)
+            string prefabsFolder = Path.Combine(ctx.ModFolder, "Prefabs");
+            if (Directory.Exists(prefabsFolder))
             {
-                prefabName = m.Groups[1].Value;
-                string prefabsFolder = Path.Combine(ctx.ModFolder, "Prefabs");
-                if (Directory.Exists(prefabsFolder))
+                // probeer exact
+                var matches = Directory.GetFiles(prefabsFolder, shortName + ".prefab", SearchOption.AllDirectories);
+                if (matches.Length == 0)
                 {
-                    string[] matches = Directory.GetFiles(prefabsFolder, prefabName + ".prefab", SearchOption.AllDirectories);
-                    if (matches.Length > 0)
-                    {
-                        string assetPath = ModDesignerWindow.SystemPathToAssetPath(matches[0]);
-                        var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
-                        if (prefab != null) return prefab;
-                    }
+                    // en als laatste redmiddel: bevat naam (kan false positives geven)
+                    matches = Directory.GetFiles(prefabsFolder, "*" + shortName + "*.prefab", SearchOption.AllDirectories);
+                }
+                if (matches.Length > 0)
+                {
+                    string assetPath = ModDesignerWindow.SystemPathToAssetPath(matches[0]);
+                    if (!string.IsNullOrEmpty(assetPath))
+                        return AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
                 }
             }
         }
+        catch { /* ignore */ }
+
         return null;
     }
+
+    // Zoekt een modelwaarde (Model/Meshfile) in entry of via extends-keten (eerst mod, dan base game)
+    string ResolveModelValueWithExtends(XElement entry)
+    {
+        // 1) Probeer op het huidige entry (inclusief nested property-groepen)
+        if (TryGetModelLikeValue(entry, out var val))
+            return val;
+
+        // 2) Volg extends-keten (max 12 stappen)
+        int guard = 0;
+        string target = GetExtendsTarget(entry);
+        XDocument baseDoc = null;
+
+        while (!string.IsNullOrEmpty(target) && guard++ < 12)
+        {
+            // in huidig doc
+            var parent = FindEntryByName(target, doc);
+            if (parent == null && !string.IsNullOrEmpty(ctx?.GameConfigPath))
+            {
+                // in base game doc
+                string basePath = Path.Combine(ctx.GameConfigPath, fileName);
+                if (File.Exists(basePath))
+                    baseDoc ??= XDocument.Load(basePath);
+                parent = FindEntryByName(target, baseDoc);
+            }
+
+            if (parent == null)
+                break;
+
+            if (TryGetModelLikeValue(parent, out val))
+                return val;
+
+            target = GetExtendsTarget(parent);
+        }
+
+        return null;
+    }
+
+    // Leest 'Model' of 'Meshfile' uit alle descendant <property>-nodes (dus ook binnen groups)
+    bool TryGetModelLikeValue(XElement entry, out string value)
+    {
+        value = null;
+        foreach (var p in entry.Descendants("property"))
+        {
+            var name = (string)p.Attribute("name");
+            if (string.IsNullOrEmpty(name)) continue;
+
+            if (string.Equals(name, "Model", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "Meshfile", StringComparison.OrdinalIgnoreCase))
+            {
+                var v = (string)p.Attribute("value");
+                if (!string.IsNullOrEmpty(v))
+                {
+                    value = v;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Haal prefabnaam uit een Model/Meshfile value
+    string ExtractPrefabName(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return null;
+
+        // Als er een '?' in zit, neem alles na de laatste '?'
+        int q = raw.LastIndexOf('?');
+        string tail = (q >= 0) ? raw.Substring(q + 1) : raw;
+
+        // Strip eventuele pad + extensie en "(Clone)"
+        string name = Path.GetFileNameWithoutExtension(tail)?.Trim();
+        if (string.IsNullOrEmpty(name)) return null;
+        if (name.EndsWith("(Clone)", StringComparison.Ordinal))
+            name = name.Substring(0, name.Length - "(Clone)".Length).Trim();
+
+        return name;
+    }
+
+    // Kies de beste prefab-asset uit een lijst GUIDs: eerst binnen deze mod, dan eerste de beste
+    string PickBestPrefabPath(string[] guids, string shortName)
+    {
+        if (guids == null || guids.Length == 0) return null;
+
+        string modAssetRoot = ModDesignerWindow.SystemPathToAssetPath(ctx.ModFolder)?.TrimEnd('/') ?? "";
+
+        // 1) exacte bestandsnaam binnen de mod
+        foreach (var g in guids)
+        {
+            string p = AssetDatabase.GUIDToAssetPath(g);
+            if (!string.IsNullOrEmpty(modAssetRoot) && p.StartsWith(modAssetRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                if (string.Equals(Path.GetFileNameWithoutExtension(p), shortName, StringComparison.OrdinalIgnoreCase))
+                    return p;
+            }
+        }
+        // 2) exacte bestandsnaam ergens
+        foreach (var g in guids)
+        {
+            string p = AssetDatabase.GUIDToAssetPath(g);
+            if (string.Equals(Path.GetFileNameWithoutExtension(p), shortName, StringComparison.OrdinalIgnoreCase))
+                return p;
+        }
+        // 3) anders: eerste binnen de mod
+        foreach (var g in guids)
+        {
+            string p = AssetDatabase.GUIDToAssetPath(g);
+            if (!string.IsNullOrEmpty(modAssetRoot) && p.StartsWith(modAssetRoot, StringComparison.OrdinalIgnoreCase))
+                return p;
+        }
+        // 4) laatste redmiddel
+        return AssetDatabase.GUIDToAssetPath(guids[0]);
+    }
+
 
     // EntryXmlModule.cs - updated MakeCustomIconFromModel() function
     void MakeCustomIconFromModel(XElement entry)
