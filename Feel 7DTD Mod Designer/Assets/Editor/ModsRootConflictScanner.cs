@@ -22,7 +22,7 @@ public class ModsRootConflictScanner : EditorWindow
         public string MaterialsPath; // .../Materials
         public string TexturesPath;  // .../Textures
         public string XmlPath;       // .../XML
-        public string ModelsPath;       // .../Models
+        public string ModelsPath;    // .../Models
         public string MeshesPath;    // .../Meshes
         public bool HasPrefabs => AssetDatabase.IsValidFolder(PrefabsPath);
         public bool HasMaterials => AssetDatabase.IsValidFolder(MaterialsPath);
@@ -36,11 +36,11 @@ public class ModsRootConflictScanner : EditorWindow
     {
         public ModInfo Mod;
         public string PrefabPath;
-        public string PrefabName;        // file-name zonder extensie
+        public string PrefabName;        // file name without extension
         public string RendererPath;
         public int MaterialSlot;
-        public string SourceMatPath;     // huidige asset path
-        public string DestMatPath;       // voorstel (wordt herberekend bij Execute o.b.v. gekozen naming)
+        public string SourceMatPath;     // current asset path
+        public string DestMatPath;       // suggestion (recomputed in Execute based on chosen naming)
         public bool Selected = true;
         public string Reason;            // OutsideThisMod | WrongFolder
     }
@@ -48,24 +48,24 @@ public class ModsRootConflictScanner : EditorWindow
     class TexConflict
     {
         public ModInfo Mod;
-        public string MaterialPath;      // .mat in (of onder) deze mod
+        public string MaterialPath;      // .mat in (or under) this mod
         public string PropertyName;      // _BaseMap/_MainTex/etc.
-        public string SourceTexPath;     // huidige asset path
-        public string DestTexPath;       // voorstel (wordt herberekend bij Execute o.b.v. gekozen naming)
-        public string PreferredPrefabName; // indien bekend: prefab die deze material gebruikt (eerste)
+        public string SourceTexPath;     // current asset path
+        public string DestTexPath;       // suggestion (recomputed in Execute based on chosen naming)
+        public string PreferredPrefabName; // if known: prefab that uses this material (first one)
         public bool Selected = true;
         public string Reason;            // OutsideThisMod | WrongFolder
     }
 
     // ---- UI / State ----
-    string _rootPath = "Assets/Mods/Root";
+    string _rootPath = "Assets/Mods";
     Vector2 _modsScroll, _reportScroll, _foldersScroll;
     List<ModInfo> _mods = new();
     ModInfo _selectedMod;
     bool _scanning;
     bool _cancelScan;
 
-    // Resultaten
+    // Results
     List<MatConflict> _matConf = new();
     List<TexConflict> _texConf = new();
 
@@ -78,23 +78,23 @@ public class ModsRootConflictScanner : EditorWindow
     bool _resizingFoldersList;
     float _foldersStartH, _foldersStartY;
 
-    // Naming opties
+    // Naming options
     NamingMode _materialNaming = NamingMode.KeepOriginal;
     NamingMode _textureNaming = NamingMode.KeepOriginal;
 
-    // Bekende mappen voor jouw standaard
+    // Known folders for your standard
     static readonly string[] kKnownFolders = new[]
     {
         "XML","Prefabs","Materials","Textures","Models","Meshes","Scenes","Animations","Particles","Scripts"
     };
 
-    // reverse index: material -> set(prefabPaths) (gevuld tijdens prefab-scan)
+    // reverse index: material -> set(prefabPaths) (filled during prefab scan)
     readonly Dictionary<string, HashSet<string>> _matToPrefabs = new(StringComparer.OrdinalIgnoreCase);
 
     void OnGUI()
     {
         EditorGUILayout.Space(4);
-        EditorGUILayout.LabelField("Root mods map", EditorStyles.boldLabel);
+        EditorGUILayout.LabelField("Root mods folder", EditorStyles.boldLabel);
 
         EditorGUILayout.BeginHorizontal();
         _rootPath = EditorGUILayout.TextField(_rootPath);
@@ -104,7 +104,7 @@ public class ModsRootConflictScanner : EditorWindow
             if (!string.IsNullOrEmpty(pick) && pick.Replace('\\', '/').Contains("/Assets/"))
                 _rootPath = "Assets" + pick.Replace('\\', '/').Split(new[] { "/Assets" }, StringSplitOptions.None)[1];
             else if (!string.IsNullOrEmpty(pick))
-                EditorUtility.DisplayDialog("Ongeldig", "Kies een map binnen je Unity project (Assets/…)", "OK");
+                EditorUtility.DisplayDialog("Invalid", "Choose a folder inside your Unity project (Assets/…)", "OK");
         }
         if (GUILayout.Button("Scan all mods", GUILayout.Width(120)))
         {
@@ -116,7 +116,7 @@ public class ModsRootConflictScanner : EditorWindow
 
         if (!Directory.Exists(AbsPath(_rootPath)))
         {
-            EditorGUILayout.HelpBox("Root map bestaat nog niet.", MessageType.Warning);
+            EditorGUILayout.HelpBox("Root folder does not exist yet.", MessageType.Warning);
             return;
         }
 
@@ -127,7 +127,7 @@ public class ModsRootConflictScanner : EditorWindow
         _modsScroll = EditorGUILayout.BeginScrollView(_modsScroll, GUILayout.Height(_modsListHeight));
         if (_mods.Count == 0)
         {
-            EditorGUILayout.HelpBox("Nog niet gescand. Klik 'Scan all mods'.", MessageType.Info);
+            EditorGUILayout.HelpBox("Not scanned yet. Click 'Scan all mods'.", MessageType.Info);
         }
         else
         {
@@ -145,12 +145,12 @@ public class ModsRootConflictScanner : EditorWindow
                 GUILayout.Label(ok ? "Prefabs ✓" : "Prefabs ✗",
                     ok ? EditorStyles.miniBoldLabel : EditorStyles.miniLabel, GUILayout.Width(90));
 
-                // Models-status (als je die vorige patch al hebt)
+                // Models status (if you have that previous patch)
                 ok = m.HasModels;
                 GUILayout.Label(ok ? "Models ✓" : "Models ✗",
                     ok ? EditorStyles.miniBoldLabel : EditorStyles.miniLabel, GUILayout.Width(90));
 
-                // Meshes-status
+                // Meshes status
                 ok = m.HasMeshes;
                 GUILayout.Label(ok ? "Meshes ✓" : "Meshes ✗",
                     ok ? EditorStyles.miniBoldLabel : EditorStyles.miniLabel, GUILayout.Width(90));
@@ -166,7 +166,7 @@ public class ModsRootConflictScanner : EditorWindow
 
         if (_selectedMod == null)
         {
-            EditorGUILayout.HelpBox("Klik op een mod om te scannen.", MessageType.Info);
+            EditorGUILayout.HelpBox("Click a mod to scan.", MessageType.Info);
             return;
         }
 
@@ -174,15 +174,15 @@ public class ModsRootConflictScanner : EditorWindow
         EditorGUILayout.Space(6);
         DrawModHeader(_selectedMod);
 
-        // Folders overzicht (kleurcodes + create buttons)
+        // Folders overview (color codes + create buttons)
         DrawFolderOverview(_selectedMod);
 
-        // ---- ACTIES: SCAN / STOP ----
+        // ---- ACTIONS: SCAN / STOP ----
         EditorGUILayout.Space(4);
         EditorGUILayout.BeginHorizontal();
         using (new EditorGUI.DisabledScope(_scanning))
         {
-            if (GUILayout.Button("Scan deze mod", GUILayout.Width(140)))
+            if (GUILayout.Button("Scan this mod", GUILayout.Width(140)))
                 ScanMod(_selectedMod);
         }
         if (_scanning)
@@ -194,21 +194,21 @@ public class ModsRootConflictScanner : EditorWindow
         }
         EditorGUILayout.EndHorizontal();
 
-        // ---- NAAMGEVING ----
+        // ---- NAMING ----
         EditorGUILayout.Space(6);
         EditorGUILayout.BeginVertical("box");
-        EditorGUILayout.LabelField("Naamgeving bij kopiëren", EditorStyles.boldLabel);
+        EditorGUILayout.LabelField("Naming when copying", EditorStyles.boldLabel);
         _materialNaming = (NamingMode)EditorGUILayout.EnumPopup(new GUIContent("Materials"),
             _materialNaming);
         _textureNaming = (NamingMode)EditorGUILayout.EnumPopup(new GUIContent("Textures"),
             _textureNaming);
         EditorGUILayout.HelpBox(
-            "• Keep Original: behoudt de originele bestandsnaam.\n" +
-            "• PrefabPlusType: hernoemt naar \"<PrefabNaam> Material.mat\" of \"<PrefabNaam> Texture.<ext>\".",
+            "• Keep Original: keep the original filename.\n" +
+            "• PrefabPlusType: renames to \"<PrefabName> Material.mat\" or \"<PrefabName> Texture.<ext>\".",
             MessageType.None);
         EditorGUILayout.EndVertical();
 
-        // ---- RAPPORT + EXECUTE ----
+        // ---- REPORT + EXECUTE ----
         DrawReportAndActions();
     }
 
@@ -219,14 +219,14 @@ public class ModsRootConflictScanner : EditorWindow
 
         if (!m.HasPrefabs)
         {
-            EditorGUILayout.HelpBox("Deze mod heeft géén Prefabs map. Voor 7DTD moeten ALLE custom model prefabs hier staan.", MessageType.Error);
+            EditorGUILayout.HelpBox("This mod does not have a Prefabs folder. For 7DTD, ALL custom model prefabs must live here.", MessageType.Error);
             EditorGUILayout.BeginHorizontal();
-            if (GUILayout.Button("Maak Prefabs map"))
+            if (GUILayout.Button("Create Prefabs folder"))
             {
                 EnsureFolder(m.PrefabsPath);
                 AssetDatabase.Refresh();
             }
-            if (GUILayout.Button("Open mod map"))
+            if (GUILayout.Button("Open mod folder"))
                 EditorUtility.RevealInFinder(AbsPath(m.ModPath));
             EditorGUILayout.EndHorizontal();
         }
@@ -235,25 +235,25 @@ public class ModsRootConflictScanner : EditorWindow
 
     void DrawFolderOverview(ModInfo m)
     {
-        // verzamel subfolders
+        // collect subfolders
         var present = GetSubFolders(m.ModPath).Select(Path.GetFileName).Where(n => !string.IsNullOrEmpty(n)).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         _foldersScroll = EditorGUILayout.BeginScrollView(_foldersScroll, GUILayout.Height(_foldersListHeight));
-        // Bekende mappen
+        // Known folders
         foreach (var k in kKnownFolders)
         {
             bool exists = present.Contains(k);
             DrawFolderRow(m, k, exists,
                 exists ? new Color(0.75f, 0.75f, 0.75f) : new Color(1f, 0.4f, 0.4f),
-                exists ? "Bestaat" : "Ontbreekt",
+                exists ? "Exists" : "Missing",
                 allowCreate: !exists);
             present.Remove(k);
         }
 
-        // Onbekend (overige) → geel
+        // Unknown (others) → yellow
         foreach (var unk in present.OrderBy(s => s, StringComparer.OrdinalIgnoreCase))
         {
-            DrawFolderRow(m, unk, true, new Color(1f, 0.9f, 0.3f), "Onbekend", allowCreate: false);
+            DrawFolderRow(m, unk, true, new Color(1f, 0.9f, 0.3f), "Unknown", allowCreate: false);
         }
         EditorGUILayout.EndScrollView();
 
@@ -263,7 +263,7 @@ public class ModsRootConflictScanner : EditorWindow
     void DrawFolderRow(ModInfo m, string folderName, bool exists, Color color, string tag, bool allowCreate)
     {
         Rect r = EditorGUILayout.BeginHorizontal("box");
-        // kleurblokje
+        // color dot
         var dot = new Rect(r.x + 6, r.y + 6, 12, 12);
         EditorGUI.DrawRect(dot, color);
 
@@ -291,7 +291,7 @@ public class ModsRootConflictScanner : EditorWindow
         EditorGUILayout.EndHorizontal();
     }
 
-    // --- Rapport + uitvoeren ---
+    // --- Report + execute ---
     void DrawReportAndActions()
     {
         EditorGUILayout.Space(6);
@@ -299,7 +299,7 @@ public class ModsRootConflictScanner : EditorWindow
 
         if (_matConf.Count == 0 && _texConf.Count == 0)
         {
-            EditorGUILayout.HelpBox("Geen conflicten (of nog niet gescand).", MessageType.Info);
+            EditorGUILayout.HelpBox("No conflicts (or not scanned yet).", MessageType.Info);
         }
         else
         {
@@ -315,7 +315,7 @@ public class ModsRootConflictScanner : EditorWindow
                     EditorGUILayout.LabelField("Reason", c.Reason, EditorStyles.miniLabel);
                     EditorGUILayout.LabelField("Material", c.SourceMatPath, EditorStyles.miniLabel);
 
-                    // Toon actuele bestemming obv huidige naming-optie (live herberekend)
+                    // Show current destination based on current naming option (live recomputed)
                     string previewDest = MakeMaterialDestPath(c);
                     EditorGUILayout.LabelField("→ Copy to", previewDest, EditorStyles.miniLabel);
 
@@ -339,7 +339,7 @@ public class ModsRootConflictScanner : EditorWindow
                     EditorGUILayout.LabelField("Reason", c.Reason, EditorStyles.miniLabel);
                     EditorGUILayout.LabelField("Texture", c.SourceTexPath, EditorStyles.miniLabel);
 
-                    // Live herberekende bestemming o.b.v. huidige naming
+                    // Live recomputed destination based on current naming
                     string previewDest = MakeTextureDestPath(c, baseName);
                     EditorGUILayout.LabelField("→ Copy to", previewDest, EditorStyles.miniLabel);
 
@@ -405,7 +405,7 @@ public class ModsRootConflictScanner : EditorWindow
 
         try
         {
-            // 1) Prefabs doorlopen -> material-conflicts + reverse index material->prefabs
+            // 1) Walk prefabs -> material conflicts + reverse index material->prefabs
             var prefabs = FindAssetsUnder(mod.PrefabsPath, "*.prefab");
             int total = prefabs.Length;
             for (int i = 0; i < total; i++)
@@ -443,7 +443,7 @@ public class ModsRootConflictScanner : EditorWindow
                                 _matToPrefabs[matPath] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                             set.Add(pp);
 
-                            // Regel: material moet in .../Materials van deze mod staan
+                            // Rule: material must be in this mod's .../Materials folder
                             bool underThisMod = IsUnder(matPath, mod.ModPath);
                             bool underMaterials = IsUnder(matPath, mod.MaterialsPath);
 
@@ -464,7 +464,7 @@ public class ModsRootConflictScanner : EditorWindow
                                         Mod = mod,
                                         PrefabName = prefabName,
                                         SourceMatPath = matPath
-                                    }) // voorlopige preview
+                                    }) // preliminary preview
                                 });
                             }
                         }
@@ -477,7 +477,7 @@ public class ModsRootConflictScanner : EditorWindow
             }
             EditorUtility.ClearProgressBar();
 
-            // 2) Alle materials (onder deze mod) -> texture-conflicts
+            // 2) All materials (under this mod) -> texture conflicts
             var modMatAssets = FindAssetsUnder(mod.ModPath, "*.mat");
             for (int i = 0; i < modMatAssets.Length; i++)
             {
@@ -494,7 +494,7 @@ public class ModsRootConflictScanner : EditorWindow
                 var mat = AssetDatabase.LoadAssetAtPath<Material>(mp);
                 if (!mat) continue;
 
-                // bepaal bij voorkeur 1 prefabnaam die deze material gebruikt
+                // determine one preferred prefab name that uses this material
                 string preferredPrefab = null;
                 if (_matToPrefabs.TryGetValue(mp, out var users) && users.Count > 0)
                 {
@@ -530,7 +530,7 @@ public class ModsRootConflictScanner : EditorWindow
                                 MaterialPath = mp,
                                 SourceTexPath = txPath,
                                 PreferredPrefabName = preferredPrefab
-                            }, preferredPrefab) // voorlopige preview
+                            }, preferredPrefab) // preliminary preview
                         });
                     }
                 }
@@ -548,8 +548,8 @@ public class ModsRootConflictScanner : EditorWindow
     void ExecuteFixes()
     {
         // ========== MATERIALS ==========
-        // Groepeer per (Mod, SourceMatPath) → 1 kopie per bron
-        // --- MATERIALS: eerst ALLEEN kopiëren in batch ---
+        // Group per (Mod, SourceMatPath) → 1 copy per source
+        // --- MATERIALS: first ONLY copying in batch ---
         var matGroups = _matConf.Where(x => x.Selected)
             .GroupBy(x => (x.Mod, x.SourceMatPath), x => x, new MatKeyComparer())
             .ToList();
@@ -579,7 +579,7 @@ public class ModsRootConflictScanner : EditorWindow
             AssetDatabase.Refresh();
         }
 
-        // --- PAS HIER retargetten (BUITEN StartAssetEditing) ---
+        // --- ONLY here retarget (OUTSIDE StartAssetEditing) ---
         foreach (var grp in matGroups)
         {
             var mod = grp.Key.Mod;
@@ -604,11 +604,11 @@ public class ModsRootConflictScanner : EditorWindow
         AssetDatabase.SaveAssets();
         AssetDatabase.Refresh();
 
-        // Na materials opnieuw scannen zodat texture-conflicten actueel zijn
+        // After materials, rescan so texture conflicts are up-to-date
         if (_selectedMod != null) ScanMod(_selectedMod);
 
         // ========== TEXTURES ==========
-        // Groepeer per (Mod, SourceTexPath) → 1 kopie per bron
+        // Group per (Mod, SourceTexPath) → 1 copy per source
         var texGroups = _texConf
             .Where(x => x.Selected)
             .GroupBy(x => (x.Mod, x.SourceTexPath), x => x, new TexKeyComparer())
@@ -632,7 +632,7 @@ public class ModsRootConflictScanner : EditorWindow
                     continue;
                 }
 
-                // Alle materials in deze groep naar deze ENE texture laten wijzen
+                // Point all materials in this group to this ONE texture
                 var newTex = AssetDatabase.LoadAssetAtPath<Texture>(finalTexPath);
                 if (!newTex) continue;
 
@@ -654,7 +654,7 @@ public class ModsRootConflictScanner : EditorWindow
         }
 
         if (_selectedMod != null) ScanMod(_selectedMod);
-        EditorUtility.DisplayDialog("Klaar", "Dedup en fixes uitgevoerd.", "OK");
+        EditorUtility.DisplayDialog("Done", "Dedup and fixes applied.", "OK");
     }
 
     // Grouping key comparers
@@ -696,12 +696,12 @@ public class ModsRootConflictScanner : EditorWindow
     {
         if (root == null || string.IsNullOrEmpty(path)) return null;
 
-        // pad is relatieve Transform path "Root/Child/Sub"
+        // path is a relative Transform path "Root/Child/Sub"
         var t = root.transform;
         var parts = path.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length > 0 && parts[0] == root.name)
         {
-            // accepteer paden die met rootnaam beginnen
+            // accept paths that start with the root name
             parts = parts.Skip(1).ToArray();
         }
         foreach (var p in parts)
@@ -714,7 +714,7 @@ public class ModsRootConflictScanner : EditorWindow
 
     Renderer ResolveRenderer(GameObject root, string rendererPath, string oldMatGuid, int slotIndex)
     {
-        // 1) Voorkeur: via het bewaarde pad
+        // 1) Preferred: via the saved path
         var t = ResolveTransformByPath(root, rendererPath);
         var r = t ? t.GetComponent<Renderer>() : null;
         if (r)
@@ -722,10 +722,10 @@ public class ModsRootConflictScanner : EditorWindow
             var mats = r.sharedMaterials ?? Array.Empty<Material>();
             if (slotIndex >= 0 && slotIndex < mats.Length && MatGuidEquals(mats[slotIndex], oldMatGuid))
                 return r;
-            // Als slot niet matcht, laten we nog niet opgeven — fallbacks hieronder
+            // If slot doesn't match, don't give up—fallbacks below
         }
 
-        // 2) Fallback: zoek elke Renderer die in de opgegeven slot het oude materiaal heeft
+        // 2) Fallback: find any Renderer that in the given slot has the old material
         foreach (var rr in root.GetComponentsInChildren<Renderer>(true))
         {
             var mats = rr.sharedMaterials ?? Array.Empty<Material>();
@@ -733,7 +733,7 @@ public class ModsRootConflictScanner : EditorWindow
                 return rr;
         }
 
-        // 3) Laatste redmiddel: vind een renderer waar het oude mat *ergens* in zit
+        // 3) Last resort: find a renderer where the old material exists in any slot
         foreach (var rr in root.GetComponentsInChildren<Renderer>(true))
         {
             var mats = rr.sharedMaterials ?? Array.Empty<Material>();
@@ -745,7 +745,7 @@ public class ModsRootConflictScanner : EditorWindow
         return null;
     }
 
-    // ---------- Core: retarget materiaal in prefab ----------
+    // ---------- Core: retarget material in prefab ----------
     bool RetargetMaterialOnPrefab(
         string prefabPath,
         string rendererPath,
@@ -760,26 +760,26 @@ public class ModsRootConflictScanner : EditorWindow
             return false;
         }
 
-        // Gebruik de aanbevolen scope; dit laadt en sluit netjes
+        // Use the recommended scope; this loads and closes cleanly
         using (var scope = new PrefabUtility.EditPrefabContentsScope(prefabPath))
         {
             var root = scope.prefabContentsRoot;
             if (!root) return false;
 
-            // 1) Renderer vinden via path, anders fallback op oud materiaal pad
+            // 1) Find renderer by path, else fallback by old material path
             var r = ResolveRendererByPathOrOldMat(root, rendererPath, oldMatAssetPath);
             if (!r)
             {
-                Debug.LogWarning($"[ModsRootScanner] Renderer niet gevonden voor '{prefabPath}' → '{rendererPath}'.");
+                Debug.LogWarning($"[ModsRootScanner] Renderer not found for '{prefabPath}' → '{rendererPath}'.");
                 return false;
             }
 
-            // 2) Materials via SerializedObject aanpassen (robuuster voor nested instances)
+            // 2) Change materials via SerializedObject (more robust for nested instances)
             var so = new SerializedObject(r);
             var matsProp = so.FindProperty("m_Materials");
             bool changed = false;
 
-            // Vervang ALLE slots die het oude pad gebruiken
+            // Replace ALL slots that use the old path
             for (int i = 0; i < matsProp.arraySize; i++)
             {
                 var elem = matsProp.GetArrayElementAtIndex(i);
@@ -795,7 +795,7 @@ public class ModsRootConflictScanner : EditorWindow
                 }
             }
 
-            // Fallback: vervang specifieke slotIndex als er niets matchte
+            // Fallback: replace specific slotIndex if nothing matched
             if (!changed && slotIndex >= 0 && slotIndex < matsProp.arraySize)
             {
                 matsProp.GetArrayElementAtIndex(slotIndex).objectReferenceValue = newMat;
@@ -806,21 +806,21 @@ public class ModsRootConflictScanner : EditorWindow
 
             so.ApplyModifiedPropertiesWithoutUndo();
 
-            // Zorg dat overrides op nested prefab instances vastgelegd worden
+            // Ensure overrides on nested prefab instances are recorded
             if (PrefabUtility.IsPartOfPrefabInstance(r))
                 PrefabUtility.RecordPrefabInstancePropertyModifications(r);
 
-            // Markeer zowel renderer als root dirty
+            // Mark both renderer and root dirty
             EditorUtility.SetDirty(r);
             EditorUtility.SetDirty(root);
 
-            // Belangrijk: expliciet saven buiten StartAssetEditing
+            // Important: explicitly save outside StartAssetEditing
             var ok = PrefabUtility.SaveAsPrefabAsset(root, prefabPath, out bool success);
             return ok && success;
         }
     }
 
-    // Fallback zoekmethode: eerst pad, dan zoeken op oud materiaal-pad
+    // Fallback search method: first by path, then by old material path
     Renderer ResolveRendererByPathOrOldMat(GameObject root, string rendererPath, string oldMatAssetPath)
     {
         var t = ResolveTransformByPath(root, rendererPath);
@@ -877,7 +877,7 @@ public class ModsRootConflictScanner : EditorWindow
     {
         string p = abs.Replace('\\', '/');
         var idx = p.IndexOf("/Assets/", StringComparison.OrdinalIgnoreCase);
-        if (idx >= 0) return p.Substring(idx + 1); // start bij Assets/...
+        if (idx >= 0) return p.Substring(idx + 1); // start at Assets/...
         if (p.EndsWith("/Assets", StringComparison.OrdinalIgnoreCase)) return "Assets";
         return p;
     }
@@ -928,7 +928,7 @@ public class ModsRootConflictScanner : EditorWindow
 
         if (AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(candidate) != null)
         {
-            // zelfde content? hergebruik
+            // same content? reuse
             if (SameContent(sourceAsset, candidate)) return candidate;
             int n = 1;
             do
@@ -1051,10 +1051,10 @@ public class ModsRootConflictScanner : EditorWindow
         }
     }
 
-    // Bepaalt een gedeelde bestandsnaam per bronmateriaal binnen één mod.
+    // Determines a shared filename per source material within one mod.
     string ComputeSharedMatDest(ModInfo mod, string sourceMatPath, IEnumerable<MatConflict> group)
     {
-        // Kies consistente naam o.b.v. huidige naming mode
+        // choose consistent name based on current naming mode
         if (_materialNaming == NamingMode.KeepOriginal)
         {
             string file = Path.GetFileName(sourceMatPath);
@@ -1062,7 +1062,7 @@ public class ModsRootConflictScanner : EditorWindow
         }
         else
         {
-            // PrefabPlusType: kies 1 "eigenaar" deterministisch (alfabetisch kleinste prefabnaam)
+            // PrefabPlusType: deterministically choose 1 "owner" (alphabetically smallest prefab name)
             string owner = group.Select(g => g.PrefabName)
                                 .Where(n => !string.IsNullOrEmpty(n))
                                 .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
@@ -1072,7 +1072,7 @@ public class ModsRootConflictScanner : EditorWindow
         }
     }
 
-    // Bepaalt een gedeelde bestandsnaam per brontexture binnen één mod.
+    // Determines a shared filename per source texture within one mod.
     string ComputeSharedTexDest(ModInfo mod, string sourceTexPath, IEnumerable<TexConflict> group)
     {
         string ext = Path.GetExtension(sourceTexPath);
@@ -1083,7 +1083,7 @@ public class ModsRootConflictScanner : EditorWindow
         }
         else
         {
-            // PrefabPlusType: kies deterministisch 1 basisnaam (liefst prefab, anders materialnaam)
+            // PrefabPlusType: deterministically pick one base name (prefer prefab, else material name)
             string owner = group.Select(g => g.PreferredPrefabName)
                                 .Where(n => !string.IsNullOrEmpty(n))
                                 .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
