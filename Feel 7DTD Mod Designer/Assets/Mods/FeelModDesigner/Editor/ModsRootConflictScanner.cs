@@ -8,8 +8,8 @@ using System.Collections.Generic;
 
 public class ModsRootConflictScanner : EditorWindow
 {
-    [MenuItem("Tools/Mod Tools/Mods Root Scanner")]
-    static void Open() => GetWindow<ModsRootConflictScanner>("Mods Root Scanner");
+    [MenuItem("Tools/Feel 7DTD/Mods Root Resolver")]
+    static void Open() => GetWindow<ModsRootConflictScanner>("Mods Root Resolver");
 
     enum NamingMode { KeepOriginal, PrefabPlusType } // Prefab + " Material"/" Texture"
 
