@@ -1175,48 +1175,67 @@ public class EntryXmlModule : IConfigModule
             if (GUILayout.Button("▲", GUILayout.Width(28))) { MoveSibling(p, -1); }
             if (GUILayout.Button("▼", GUILayout.Width(28))) { MoveSibling(p, +1); }
 
-            if ((string)p.Attribute("name") == "Model" && ctx?.ModFolder != null)
+            if (GUILayout.Button(ModDesignerWindow.GetEyeButtonContent(), EditorStyles.miniButton, GUILayout.Width(26), GUILayout.Height(18)))
             {
-                if (GUILayout.Button("👁", GUILayout.Width(28)))
+                if (TryFindPrefabAssetOrExternalPath(parent, out var prefab, out var externalPath, out var shortName))
                 {
-                    string modelVal = p.Attribute("value")?.Value;
-                    var match = System.Text.RegularExpressions.Regex.Match(modelVal ?? "", @"\?(.+)$");
-                    if (match.Success)
+                    if (prefab != null)
                     {
-                        string prefabName = match.Groups[1].Value;
-                        string prefabsFolder = Path.Combine(ctx.ModFolder, "Prefabs");
-                        if (Directory.Exists(prefabsFolder))
-                        {
-                            string[] matches = Directory.GetFiles(prefabsFolder, prefabName + ".prefab", SearchOption.AllDirectories);
-                            if (matches.Length == 0)
-                                matches = Directory.GetFiles(prefabsFolder, "*" + prefabName + "*.prefab", SearchOption.AllDirectories);
+                        // Gewoon in project: selecteren & pingen
+                        Selection.activeObject = prefab;
+                        EditorGUIUtility.PingObject(prefab);
+                    }
+                    else if (!string.IsNullOrEmpty(externalPath))
+                    {
+                        // Buiten Assets: keuze geven
+                        int choice = EditorUtility.DisplayDialogComplex(
+                            "Prefab outside Assets",
+                            $"Prefab '{shortName}' staat buiten je Unity project:\n{externalPath}\n\nWat wil je doen?",
+                            "Open locatie",        // 0
+                            "Importeer kopie",     // 1
+                            "Annuleer"             // 2
+                        );
 
-                            if (matches.Length > 0)
+                        if (choice == 0)
+                        {
+                            // Toon in Finder/Explorer (highlight het bestand)
+                            EditorUtility.RevealInFinder(externalPath);
+                        }
+                        else if (choice == 1)
+                        {
+                            // Importeer kopie in Assets/_ImportedMods/<Mod>/Prefabs en selecteer die
+                            string assetPath = ImportExternalPrefabIntoProject(externalPath);
+                            var imported = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+                            if (imported != null)
                             {
-                                string assetPath = ModDesignerWindow.SystemPathToAssetPath(matches[0]);
-                                if (!string.IsNullOrEmpty(assetPath))
-                                {
-                                    var prefab = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath);
-                                    if (prefab != null) { Selection.activeObject = prefab; EditorGUIUtility.PingObject(prefab); }
-                                    else EditorUtility.DisplayDialog("Prefab niet geladen", $"Prefab '{prefabName}' kon niet worden geladen.", "OK");
-                                }
-                                else
-                                {
-                                    // Buiten Assets: toon uitleg en open de map
-                                    EditorUtility.DisplayDialog(
-                                        "Prefab buiten Assets",
-                                        $"De prefab staat buiten de Unity-projectmap:\n{matches[0]}\n\n" +
-                                        "Unity kan deze niet als Asset openen. Verplaats de prefab naar 'Assets/' of verwijs " +
-                                        "naar een prefab die wel in het project staat.",
-                                        "OK");
-                                    EditorUtility.RevealInFinder(matches[0]);
-                                }
+                                Selection.activeObject = imported;
+                                EditorGUIUtility.PingObject(imported);
+                                EditorUtility.DisplayDialog("Imported",
+                                    $"Prefab gekopieerd naar project:\n{assetPath}\n\nLet op: afhankelijkheden worden niet automatisch mee-gekopieerd.",
+                                    "OK");
                             }
-                            else EditorUtility.DisplayDialog("Niet gevonden", $"Prefab '{prefabName}.prefab' niet gevonden in:\n{prefabsFolder}", "OK");
+                            else
+                            {
+                                EditorUtility.DisplayDialog("Import failed",
+                                    "De prefab-kopie kon niet worden geladen na import.", "OK");
+                            }
                         }
                     }
+                    else
+                    {
+                        EditorUtility.DisplayDialog(
+                            "Prefab not found",
+                            "Kon geen prefab vinden (ook niet als extern bestand).",
+                            "OK");
+                    }
                 }
-                if (GUILayout.Button("📸", GUILayout.Width(28))) { MakeCustomIconFromModel(parent); }
+                else
+                {
+                    EditorUtility.DisplayDialog(
+                        "Prefab not found",
+                        "Kon geen prefab vinden (ook niet als extern bestand).",
+                        "OK");
+                }
             }
 
             bool remove = GUILayout.Button("-", GUILayout.Width(28));
@@ -1706,6 +1725,61 @@ public class EntryXmlModule : IConfigModule
 
         return null;
     }
+
+    // ---- Prefab resolving helpers (asset or external file) ----
+    bool TryFindPrefabAssetOrExternalPath(XElement entry, out GameObject prefabAsset, out string externalPath, out string prefabName)
+    {
+        prefabAsset = null; externalPath = null; prefabName = null;
+
+        // 1) Eerst: probeer als echte Asset (via bestaande zoeklogica)
+        prefabAsset = FindPrefabFromModel(entry, out prefabName);
+        if (prefabAsset != null) return true;
+
+        // 2) Model/Meshfile -> short prefab name
+        string modelVal = ResolveModelValueWithExtends(entry);
+        string shortName = ExtractPrefabName(modelVal);
+        if (string.IsNullOrEmpty(shortName) || string.IsNullOrEmpty(ctx?.ModFolder)) return false;
+        prefabName = shortName;
+
+        // 3) Zoek fysieke .prefab onder <ModFolder>/Prefabs (ook als mod buiten Assets staat)
+        try
+        {
+            string prefabsFolder = System.IO.Path.Combine(ctx.ModFolder, "Prefabs");
+            if (Directory.Exists(prefabsFolder))
+            {
+                // eerst exact, dan bevat
+                string exact = Directory
+                    .GetFiles(prefabsFolder, shortName + ".prefab", SearchOption.AllDirectories)
+                    .FirstOrDefault();
+                if (!string.IsNullOrEmpty(exact)) { externalPath = exact.Replace('\\', '/'); return true; }
+
+                string contains = Directory
+                    .GetFiles(prefabsFolder, "*" + shortName + "*.prefab", SearchOption.AllDirectories)
+                    .FirstOrDefault();
+                if (!string.IsNullOrEmpty(contains)) { externalPath = contains.Replace('\\', '/'); return true; }
+            }
+        }
+        catch { /* ignore */ }
+
+        return false;
+    }
+
+    // Importeer een externe .prefab als kopie in het project, zodat je ‘m kunt selecteren.
+    string ImportExternalPrefabIntoProject(string sourceFile)
+    {
+        // Waarschuwing: dit kopieert alléén de prefab, niet z’n afhankelijkheden.
+        string modNameSafe = Regex.Replace(ctx?.ModName ?? "Mod", @"[^A-Za-z0-9_\-\. ]", "_");
+        string targetDir = System.IO.Path.Combine("Assets", "_ImportedMods", modNameSafe, "Prefabs");
+        Directory.CreateDirectory(targetDir);
+
+        string destPath = System.IO.Path.Combine(targetDir, System.IO.Path.GetFileName(sourceFile));
+        File.Copy(sourceFile, destPath, true);
+
+        string assetPath = destPath.Replace('\\', '/');
+        AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceUpdate);
+        return assetPath;
+    }
+
 
     // Zoekt een modelwaarde (Model/Meshfile) in entry of via extends-keten (eerst mod, dan base game)
     string ResolveModelValueWithExtends(XElement entry)

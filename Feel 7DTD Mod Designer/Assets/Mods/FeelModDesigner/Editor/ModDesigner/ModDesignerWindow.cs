@@ -47,6 +47,43 @@ public class ModDesignerWindow : EditorWindow
 
 
 
+    public static GUIContent s_EyeBtn;
+    public static GUIContent GetEyeButtonContent()
+    {
+        if (s_EyeBtn != null) return s_EyeBtn;
+
+        // Try a few built-in icons that exist across Unity versions
+        string[] candidates = {
+        "d_scenevis_visible_hover", "scenevis_visible_hover",
+        "d_scenevis_visible", "scenevis_visible",
+        "d_ViewToolOrbit", "ViewToolOrbit",
+        "d_ViewToolZoom", "ViewToolZoom",
+        "Search Icon", "d_Search Icon"
+    };
+
+        foreach (var name in candidates)
+        {
+            var c = EditorGUIUtility.IconContent(name);
+            if (c != null && c.image != null)
+            {
+                c.tooltip = "Select & ping model prefab";
+                s_EyeBtn = c;
+                return s_EyeBtn;
+            }
+        }
+
+        // Fallback when no icon is available on this Unity version/skin
+        s_EyeBtn = new GUIContent("View", "Select & ping model prefab");
+        return s_EyeBtn;
+    }
+
+    public static bool IsModelLikeProperty(string propName)
+    {
+        return !string.IsNullOrEmpty(propName) &&
+               (propName.Equals("Model", StringComparison.OrdinalIgnoreCase) ||
+                propName.Equals("Meshfile", StringComparison.OrdinalIgnoreCase));
+    }
+
     void BuildModulesList()
     {
         modules.Clear();
