@@ -56,6 +56,10 @@ public class EntryXmlModule : IConfigModule
     static GUIStyle s_XmlTextAreaStyle;
     static bool s_FontHooked;
 
+    // EntryXmlModule.cs (class-scope)
+    XElement _patchEditorBoundEl = null;
+    string _patchEditorText = "";
+
 
     HashSet<string> _knownNames = new(StringComparer.OrdinalIgnoreCase);
     HashSet<string> _knownItems = new(StringComparer.OrdinalIgnoreCase);
@@ -271,45 +275,25 @@ public class EntryXmlModule : IConfigModule
 
     void RebuildEntries()
     {
-        if (doc == null || entryTag == null)
-        {
-            entries = new List<XElement>();
-            selectedIndex = -1;
-            return;
-        }
-
-        // Bewaar huidige selectie (op element, niet index) zodat selectie stabiel blijft
-        XElement previouslySelected = (selectedIndex >= 0 && selectedIndex < entries.Count)
-            ? entries[selectedIndex]
+        string prevName = (selectedIndex >= 0 && selectedIndex < entries.Count)
+            ? (string)entries[selectedIndex].Attribute("name")
             : null;
 
-        // Neem entries in documentvolgorde
         var all = GetEntriesInDocumentOrder();
+        entries = string.IsNullOrWhiteSpace(search)
+            ? all.ToList()
+            : all.Where(e => ((string)e.Attribute("name")).ToLowerInvariant().Contains(search.ToLowerInvariant())).ToList();
 
-        // Filter met behoud van volgorde
-        if (string.IsNullOrWhiteSpace(search))
-            entries = all.ToList();
-        else
-        {
-            var lc = search.ToLowerInvariant();
-            entries = all.Where(e => ((string)e.Attribute("name")).ToLowerInvariant().Contains(lc)).ToList();
-        }
+        if (entries.Count == 0) { selectedIndex = -1; return; }
 
-        // Herstel selectie zo goed mogelijk
-        if (entries.Count == 0)
+        if (!string.IsNullOrEmpty(prevName))
         {
-            selectedIndex = -1;
+            int byName = entries.FindIndex(e => string.Equals((string)e.Attribute("name"), prevName, StringComparison.OrdinalIgnoreCase));
+            if (byName >= 0) { selectedIndex = byName; return; }
         }
-        else if (previouslySelected != null)
-        {
-            int idx = entries.IndexOf(previouslySelected);
-            selectedIndex = (idx >= 0) ? idx : Mathf.Clamp(selectedIndex, 0, entries.Count - 1);
-        }
-        else
-        {
-            selectedIndex = Mathf.Clamp(selectedIndex, 0, entries.Count - 1);
-        }
+        selectedIndex = Mathf.Clamp(selectedIndex, 0, entries.Count - 1);
     }
+
 
     IEnumerable<XElement> GetEntriesInDocumentOrder()
     {
@@ -684,36 +668,38 @@ public class EntryXmlModule : IConfigModule
             EditorGUILayout.LabelField($"Patch: <{el.Name.LocalName}>", EditorStyles.boldLabel);
 
             string raw = el.ToString(SaveOptions.None);
+            // Bind buffer als selectie wisselt
+            if (_patchEditorBoundEl != selectedPatchEl)
+            {
+                _patchEditorBoundEl = selectedPatchEl;
+                _patchEditorText = selectedPatchEl.ToString(SaveOptions.None);
+            }
+
             var xmlStyle = GetXmlTextAreaStyle();
 
-            // Safety: zorg dat eerdere GUI-kleuren (alpha!) niet doorsijpelen
-            var prevCol = GUI.color;
-            var prevCC = GUI.contentColor;
-            var prevBG = GUI.backgroundColor;
-            GUI.color = Color.white;
-            GUI.contentColor = Color.white;
-            GUI.backgroundColor = Color.white;
+            // veilige kleuren reset (zoals je al deed)
+            var prevCol = GUI.color; var prevCC = GUI.contentColor; var prevBG = GUI.backgroundColor;
+            GUI.color = GUI.contentColor = GUI.backgroundColor = Color.white;
 
-            string changed = EditorGUILayout.TextArea(raw, xmlStyle,
-                GUILayout.ExpandHeight(true), GUILayout.MinHeight(240));
+            // gebruik de buffer i.p.v. el.ToString()
+            string _newText = EditorGUILayout.TextArea(_patchEditorText, xmlStyle, GUILayout.ExpandHeight(true), GUILayout.MinHeight(240));
+            if (!ReferenceEquals(_newText, _patchEditorText)) _patchEditorText = _newText;
 
-            GUI.color = prevCol;
-            GUI.contentColor = prevCC;
-            GUI.backgroundColor = prevBG;
-
+            GUI.color = prevCol; GUI.contentColor = prevCC; GUI.backgroundColor = prevBG;
 
             EditorGUILayout.BeginHorizontal();
             if (GUILayout.Button("Apply", GUILayout.Width(90)))
             {
                 try
                 {
-                    var repl = XElement.Parse(changed);
-                    el.ReplaceWith(repl);
+                    var repl = XElement.Parse(_patchEditorText);
+                    selectedPatchEl.ReplaceWith(repl);
                     dirty = true;
                     RebuildPatches();
-                    // behoud selectie
                     selectedPatchEl = repl;
                     selPatch = patchOps.IndexOf(repl);
+                    _patchEditorBoundEl = repl;
+                    _patchEditorText = repl.ToString(SaveOptions.None);
                 }
                 catch (Exception ex)
                 {
@@ -722,15 +708,18 @@ public class EntryXmlModule : IConfigModule
             }
             if (GUILayout.Button("Remove", GUILayout.Width(90)))
             {
-                el.Remove();
+                selectedPatchEl.Remove();
                 dirty = true;
                 RebuildPatches();
                 selectedPatchEl = null;
                 selPatch = -1;
+                _patchEditorBoundEl = null;
+                _patchEditorText = "";
             }
             GUILayout.FlexibleSpace();
             if (GUILayout.Button($"Save {fileName}", GUILayout.Width(160))) Save();
             EditorGUILayout.EndHorizontal();
+
 
             GUILayout.EndScrollView();
             if (useArea) GUILayout.EndArea();
@@ -1199,12 +1188,29 @@ public class EntryXmlModule : IConfigModule
                         if (Directory.Exists(prefabsFolder))
                         {
                             string[] matches = Directory.GetFiles(prefabsFolder, prefabName + ".prefab", SearchOption.AllDirectories);
+                            if (matches.Length == 0)
+                                matches = Directory.GetFiles(prefabsFolder, "*" + prefabName + "*.prefab", SearchOption.AllDirectories);
+
                             if (matches.Length > 0)
                             {
                                 string assetPath = ModDesignerWindow.SystemPathToAssetPath(matches[0]);
-                                var prefab = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath);
-                                if (prefab != null) { Selection.activeObject = prefab; EditorGUIUtility.PingObject(prefab); }
-                                else EditorUtility.DisplayDialog("Prefab niet geladen", $"Prefab '{prefabName}' kon niet worden geladen.", "OK");
+                                if (!string.IsNullOrEmpty(assetPath))
+                                {
+                                    var prefab = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath);
+                                    if (prefab != null) { Selection.activeObject = prefab; EditorGUIUtility.PingObject(prefab); }
+                                    else EditorUtility.DisplayDialog("Prefab niet geladen", $"Prefab '{prefabName}' kon niet worden geladen.", "OK");
+                                }
+                                else
+                                {
+                                    // Buiten Assets: toon uitleg en open de map
+                                    EditorUtility.DisplayDialog(
+                                        "Prefab buiten Assets",
+                                        $"De prefab staat buiten de Unity-projectmap:\n{matches[0]}\n\n" +
+                                        "Unity kan deze niet als Asset openen. Verplaats de prefab naar 'Assets/' of verwijs " +
+                                        "naar een prefab die wel in het project staat.",
+                                        "OK");
+                                    EditorUtility.RevealInFinder(matches[0]);
+                                }
                             }
                             else EditorUtility.DisplayDialog("Niet gevonden", $"Prefab '{prefabName}.prefab' niet gevonden in:\n{prefabsFolder}", "OK");
                         }
@@ -2100,19 +2106,26 @@ public class EntryXmlModule : IConfigModule
             string sys = Path.Combine(atlasDir, iconName + ext);
             if (!File.Exists(sys)) continue;
 
+            // Probeer eerst als Asset (wanneer het pad onder Assets/ valt)
             string assetPath = ModDesignerWindow.SystemPathToAssetPath(sys);
-            if (string.IsNullOrEmpty(assetPath)) continue;
-
-            var t = AssetDatabase.LoadAssetAtPath<Texture2D>(assetPath);
-            if (t != null)
+            if (!string.IsNullOrEmpty(assetPath))
             {
-                tex = t;
-                usedPath = sys;
-                return true;
+                var t = AssetDatabase.LoadAssetAtPath<Texture2D>(assetPath);
+                if (t != null) { tex = t; usedPath = sys; return true; }
             }
+
+            // Valt niet onder Assets? -> rechtstreeks vanaf disk laden (preview)
+            try
+            {
+                tex = LoadTextureAbsolute(sys);   // maakt een losse Texture2D (DontSave)
+                usedPath = sys;
+                return tex != null;
+            }
+            catch { /* ignore */ }
         }
         return false;
     }
+
 
     bool TryResolveIconByNameCached(string name, string labelForOrigin, out Texture2D tex, out string origin)
     {

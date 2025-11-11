@@ -145,6 +145,25 @@ public class ModDesignerWindow : EditorWindow
         GUILayout.Space(6);
         DrawTopBars();
 
+        // Adds CTRL + S to save
+        if (Event.current.type == EventType.KeyDown)
+        {
+            bool cmd = Application.platform == RuntimePlatform.OSXEditor ? Event.current.command : Event.current.control;
+            if (cmd && Event.current.keyCode == KeyCode.S)
+            {
+                // Shift+S => Save All, anders Save Current
+                if (Event.current.shift)
+                {
+                    foreach (var m in modules) m.Save();
+                }
+                else if (selectedModule >= 0 && selectedModule < modules.Count)
+                {
+                    modules[selectedModule].Save();
+                }
+                Event.current.Use();
+            }
+        }
+
         // Define main areas for mod list and content
         var area = new Rect(0, 70, position.width, position.height - 70);
         // Ensure leftWidth stays within reasonable bounds
@@ -539,7 +558,6 @@ public class ModDesignerWindow : EditorWindow
         foreach (var m in modules) m.Save();
         foreach (var mod in mods)
         {
-            BuildAssetBundleForMod(mod);
             ExportMod(mod);
         }
         EditorUtility.DisplayDialog("Export complete", $"All mods have been exported to {exportModsFolder}.", "OK");
