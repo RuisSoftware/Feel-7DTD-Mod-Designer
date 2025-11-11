@@ -468,9 +468,17 @@ public class RecipeConfigModule : IConfigModule
             return;
         }
 
-        patchOps = doc.Root?.Elements()
-            .Where(e => e.Name == "set" || e.Name == "remove" || e.Name == "append")
-            .ToList() ?? new List<XElement>();
+        string containerXpath = "/recipes";
+
+        // Show ALL patches, including the append to "/<rootTag>"
+        patchOps = doc.Root
+            .Descendants()
+            .Where(e =>
+                e.Name == "set" ||
+                e.Name == "remove" ||
+                (e.Name == "append" &&
+                 !string.Equals((string)e.Attribute("xpath"), containerXpath, StringComparison.OrdinalIgnoreCase)))
+            .ToList();
 
         selectedPatch = patchOps.Count > 0 ? Mathf.Clamp(selectedPatch, 0, patchOps.Count - 1) : -1;
     }
