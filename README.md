@@ -20,7 +20,7 @@ A Unity editor toolkit to **create, inspect, and ship** mods for *7 Days to Die 
 
 ---
 
-## Screenshots
+## Screenshots from version alpha 0.1
 **Mod Designer (Patches)**
   
 ![Mod Designer – Patches](https://github.com/RuisSoftware/Feel-7DTD-Mod-Designer/blob/main/Screenshots/Mod%20Designer%20Patches.png?raw=true)
