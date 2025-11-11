@@ -37,6 +37,8 @@ public class EntryXmlModule : IConfigModule
     // --- patches (set/append/remove) ---
     List<XElement> patchOps = new();
     int selPatch = -1;
+    XElement selectedPatchEl = null;                 // NEW: stabiele referentie naar geselecteerde patch
+    HashSet<XElement> multiPatchSel = new();         // NEW: multi-select set
     Vector2 patchScroll;
 
     // EntryXmlModule.cs - add this field in class definition
@@ -74,6 +76,10 @@ public class EntryXmlModule : IConfigModule
     static readonly System.Collections.Generic.HashSet<string> _iconMissingCache =
         new(System.StringComparer.OrdinalIgnoreCase);
 
+    XDocument _baseGameDoc = null;
+    string _baseGameDocPath = null;
+    Dictionary<string, XElement> _baseGameIndex = null;
+
     void ClearIconCache(string name = null)
     {
         if (string.IsNullOrEmpty(name))
@@ -109,6 +115,8 @@ public class EntryXmlModule : IConfigModule
         entries.Clear(); selectedIndex = -1; search = ""; dirty = false;
         doc = null; filePath = null; foldouts.Clear();
         patchOps.Clear(); selPatch = -1;
+
+        InvalidateBaseGameCaches(); // <-- NIEUW
 
         if (!ctx.HasValidMod) return;
 
@@ -266,9 +274,9 @@ public class EntryXmlModule : IConfigModule
 
     // ------------------- LIST PANE -------------------
     // EntryXmlModule.cs - updated OnGUIList() function
+    // --- REPLACE COMPLETELY ---
     public void OnGUIList(Rect rect)
     {
-
         if (patchLabelStyle == null)
         {
             patchLabelStyle = new GUIStyle(EditorStyles.label)
@@ -318,13 +326,14 @@ public class EntryXmlModule : IConfigModule
             {
                 doc = null;
             }
+            InvalidateBaseGameCaches(); // <-- NIEUW
             RebuildEntries();
             RebuildPatches();
             BuildValidNameIndex();
         }
         EditorGUILayout.EndHorizontal();
 
-        // Top buttons: New (with submenu) + Import
+        // Top buttons: New (with submenu) + Import + Delete + Move
         EditorGUILayout.BeginHorizontal();
         if (GUILayout.Button("+ New"))
         {
@@ -350,6 +359,7 @@ public class EntryXmlModule : IConfigModule
                             RebuildEntries();
                             selectedIndex = entries.IndexOf(el);
                             selPatch = -1;
+                            selectedPatchEl = null;
                         }
                     }
                 });
@@ -391,11 +401,37 @@ public class EntryXmlModule : IConfigModule
         GUI.enabled = true;
         EditorGUILayout.EndHorizontal();
 
-        // Patch list (top section)
+        // ---- PATCH LIST (clickable rows + multi-select) ----
         GUILayout.Space(4);
         GUILayout.Label("Patches (set / append / remove)", EditorStyles.boldLabel);
 
         RebuildPatches();
+
+        EditorGUILayout.BeginHorizontal();
+        if (GUILayout.Button("Normalize layout", GUILayout.Width(140)))
+        {
+            NormalizeDocumentLayout();
+            RebuildEntries();
+            RebuildPatches();
+        }
+        if (GUILayout.Button("Reload", GUILayout.Width(70)))
+        {
+            doc = XDocument.Load(filePath);
+            InvalidateBaseGameCaches(); // <-- NIEUW
+            RebuildPatches();
+        }
+        GUILayout.FlexibleSpace();
+        GUI.enabled = multiPatchSel.Count > 0;
+        if (GUILayout.Button("▲ Move", GUILayout.Width(80))) MoveSelectedPatches(-1);
+        if (GUILayout.Button("▼ Move", GUILayout.Width(80))) MoveSelectedPatches(+1);
+        if (GUILayout.Button("Delete", GUILayout.Width(80))) DeleteSelectedPatches();
+        GUI.enabled = true;
+        if (GUILayout.Button("Select all", GUILayout.Width(90)))
+            multiPatchSel = new HashSet<XElement>(patchOps);
+        if (GUILayout.Button("None", GUILayout.Width(70)))
+            multiPatchSel.Clear();
+        EditorGUILayout.EndHorizontal();
+
         patchScroll = GUILayout.BeginScrollView(patchScroll, GUILayout.Height(patchListHeight));
 
         float rowHeight = EditorGUIUtility.singleLineHeight * 2.2f;
@@ -403,29 +439,82 @@ public class EntryXmlModule : IConfigModule
         {
             var patch = patchOps[i];
             string xp = (string?)patch.Attribute("xpath") ?? "(xpath?)";
-            string label = $"{patch.Name.LocalName}  {Truncate(xp, 60)}";
-            GUIContent content = new GUIContent(label, xp);
+            int childCount = (patch.Name == "append") ? patch.Elements().Count() : 0;
 
-            Rect rowRect = GUILayoutUtility.GetRect(content, patchLabelStyle, GUILayout.ExpandWidth(true), GUILayout.Height(rowHeight));
-            if (i == selPatch)
-                EditorGUI.DrawRect(rowRect, patchSelectedColor);
-
-            Rect toggleRect = new Rect(rowRect.x + 6, rowRect.y + (rowHeight - 16f) / 2, 16, 16);
-            bool newSelected = GUI.Toggle(toggleRect, i == selPatch, GUIContent.none, EditorStyles.radioButton);
-            if (newSelected && i != selPatch)
+            string label = patch.Name.LocalName switch
             {
-                selPatch = i;
-                selectedIndex = -1;
-                GUI.FocusControl(null);
-                EditorWindow.focusedWindow?.Repaint();
+                "set" => $"set     {Truncate(xp, 70)}",
+                "remove" => $"remove  {Truncate(xp, 70)}",
+                "append" => $"append  {Truncate(xp, 54)}  {(childCount > 0 ? $"[{childCount} child{(childCount == 1 ? "" : "ren")}]" : "")}",
+                _ => $"{patch.Name.LocalName}  {Truncate(xp, 70)}"
+            };
+
+            Rect rowRect = GUILayoutUtility.GetRect(new GUIContent(label), patchLabelStyle,
+                                                    GUILayout.ExpandWidth(true), GUILayout.Height(rowHeight));
+
+            bool isMainSelected = (selectedPatchEl == patch);
+            bool isMultiSelected = multiPatchSel.Contains(patch);
+
+            if (isMainSelected)
+                EditorGUI.DrawRect(rowRect, new Color(1f, 0.6f, 0.2f, 0.35f)); // main select
+            else if (isMultiSelected)
+                EditorGUI.DrawRect(rowRect, new Color(0.2f, 0.7f, 1f, 0.20f));  // multi select
+
+            // Multi-select checkbox
+            Rect checkRect = new Rect(rowRect.x + 6, rowRect.y + (rowHeight - 16f) / 2, 16, 16);
+            bool before = isMultiSelected;
+            bool after = GUI.Toggle(checkRect, before, GUIContent.none);
+            if (after != before)
+            {
+                if (after) multiPatchSel.Add(patch);
+                else multiPatchSel.Remove(patch);
+                GUI.changed = true;
             }
 
-            Rect labelRect = new Rect(rowRect.x + 26, rowRect.y + 2, rowRect.width - 30, rowHeight - 4);
-            GUI.Label(labelRect, content, patchLabelStyle);
+            // Clickable label (whole row)
+            Rect labelRect = new Rect(rowRect.x + 28, rowRect.y + 2, rowRect.width - 32, rowHeight - 4);
+            GUI.Label(labelRect, new GUIContent(label, xp), patchLabelStyle);
+
+            if (Event.current.type == EventType.MouseDown &&
+                rowRect.Contains(Event.current.mousePosition) &&
+                !checkRect.Contains(Event.current.mousePosition))
+            {
+                // <<< BELANGRIJK: deselecteer entry zodat patch-editor zichtbaar wordt >>>
+                selectedIndex = -1;
+                selectedPatchEl = patch;
+                selPatch = i;
+                GUI.FocusControl(null);
+                EditorWindow.focusedWindow?.Repaint();
+                Event.current.Use();
+            }
         }
 
         GUILayout.EndScrollView();
 
+        // Splitter to resize patch list
+        Rect splitterRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(4), GUILayout.ExpandWidth(true));
+        EditorGUI.DrawRect(new Rect(splitterRect.x, splitterRect.y + splitterRect.height / 2 - 1, splitterRect.width, 2), new Color(1f, 0.5f, 0f, 0.6f));
+        EditorGUIUtility.AddCursorRect(splitterRect, MouseCursor.ResizeVertical);
+        if (Event.current.type == EventType.MouseDown && splitterRect.Contains(Event.current.mousePosition))
+        {
+            resizingPatchList = true;
+            startPatchHeight = patchListHeight;
+            startMouseY = GUIUtility.GUIToScreenPoint(Event.current.mousePosition).y;
+            Event.current.Use();
+        }
+        if (resizingPatchList && Event.current.type == EventType.MouseDrag)
+        {
+            float currentMouseY = GUIUtility.GUIToScreenPoint(Event.current.mousePosition).y;
+            float delta = currentMouseY - startMouseY;
+            patchListHeight = Mathf.Clamp(startPatchHeight + delta, 60f, 500f);
+            EditorWindow.focusedWindow?.Repaint();
+            Event.current.Use();
+        }
+        if (resizingPatchList && Event.current.type == EventType.MouseUp)
+        {
+            resizingPatchList = false;
+            Event.current.Use();
+        }
 
         if (selectedIndex >= 0 && selectedIndex < entries.Count)
         {
@@ -434,38 +523,7 @@ public class EntryXmlModule : IConfigModule
             GUI.Label(last, new GUIContent("", "Klik op een entry om die te bewerken — deselecteer eerst om patches te activeren"));
         }
 
-        // Draggable splitter for patch list height
-        Rect splitterRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(4), GUILayout.ExpandWidth(true));
-        EditorGUI.DrawRect(new Rect(splitterRect.x, splitterRect.y + splitterRect.height / 2 - 1, splitterRect.width, 2), new Color(1f, 0.5f, 0f, 0.6f));
-        EditorGUIUtility.AddCursorRect(splitterRect, MouseCursor.ResizeVertical);
-        // Splitter gedrag (patchListHeight drag)
-        if (Event.current.type == EventType.MouseDown && splitterRect.Contains(Event.current.mousePosition))
-        {
-            resizingPatchList = true;
-            startPatchHeight = patchListHeight;
-            startMouseY = GUIUtility.GUIToScreenPoint(Event.current.mousePosition).y;
-            Event.current.Use();
-        }
-
-        if (resizingPatchList && Event.current.type == EventType.MouseDrag)
-        {
-            float currentMouseY = GUIUtility.GUIToScreenPoint(Event.current.mousePosition).y;
-            float delta = currentMouseY - startMouseY;
-            patchListHeight = Mathf.Clamp(startPatchHeight + delta, 60f, 500f);
-            EditorWindow.focusedWindow?.Repaint();
-
-            // alleen Use() als muis boven de splitter zit
-            if (splitterRect.Contains(Event.current.mousePosition))
-                Event.current.Use();
-        }
-
-        if (resizingPatchList && Event.current.type == EventType.MouseUp)
-        {
-            resizingPatchList = false;
-            Event.current.Use();
-        }
-
-        // Entry list (bottom section)
+        // ---- ENTRY LIST ----
         GUILayout.Space(6);
         GUILayout.Label(entryTag != null ? $"{entryTag}s" : "Entries", EditorStyles.boldLabel);
 
@@ -487,6 +545,7 @@ public class EntryXmlModule : IConfigModule
             {
                 selectedIndex = i;
                 selPatch = -1;
+                selectedPatchEl = null;
                 EditorWindow.focusedWindow?.Repaint();
             }
             GUI.backgroundColor = Color.white;
@@ -507,6 +566,7 @@ public class EntryXmlModule : IConfigModule
 
         if (useArea) GUILayout.EndArea();
     }
+
 
 
     void MoveEntry(int delta)
@@ -543,6 +603,7 @@ public class EntryXmlModule : IConfigModule
     {
         bool useArea = rect.width > 0 && rect.height > 0;
         if (useArea) GUILayout.BeginArea(rect, EditorStyles.helpBox);
+
         if (!ctx.HasValidMod)
         {
             GUILayout.Label("Select a mod on the left.");
@@ -550,23 +611,25 @@ public class EntryXmlModule : IConfigModule
             return;
         }
 
-        // If an entry is selected, ensure patch selection is cleared
-        if (selectedIndex >= 0 && selectedIndex < entries.Count)
-            selPatch = -1;
+        // ---- PATCH INSPECTOR FIRST (heeft voorrang boven entry UI) ----
+        // herstel referentie als de node door normaliseren/saven is vervangen
+        if (selectedPatchEl != null && !patchOps.Contains(selectedPatchEl) && selPatch >= 0 && selPatch < patchOps.Count)
+            selectedPatchEl = patchOps[selPatch];
 
-        // Show patch inspector if a patch is selected
-        if (selPatch >= 0 && selPatch < patchOps.Count)
+        if (selectedPatchEl != null && patchOps.Contains(selectedPatchEl))
         {
             rightScroll = GUILayout.BeginScrollView(rightScroll);
-            var el = patchOps[selPatch];
+            var el = selectedPatchEl;
+
             EditorGUILayout.LabelField($"Patch: <{el.Name.LocalName}>", EditorStyles.boldLabel);
 
             string raw = el.ToString(SaveOptions.None);
             var xmlStyle = new GUIStyle(EditorStyles.textArea) { wordWrap = true };
-            // Use monospaced font for XML display if available
-            Font codeFont = Font.CreateDynamicFontFromOSFont(new string[] { "Consolas", "Courier New", "Lucida Console", "Menlo", "Monaco" }, 12);
+            Font codeFont = Font.CreateDynamicFontFromOSFont(
+                new string[] { "Consolas", "Courier New", "Lucida Console", "Menlo", "Monaco" }, 12);
             if (codeFont) xmlStyle.font = codeFont;
             xmlStyle.richText = false;
+
             string changed = EditorGUILayout.TextArea(raw, xmlStyle, GUILayout.ExpandHeight(true), GUILayout.MinHeight(240));
 
             EditorGUILayout.BeginHorizontal();
@@ -578,6 +641,8 @@ public class EntryXmlModule : IConfigModule
                     el.ReplaceWith(repl);
                     dirty = true;
                     RebuildPatches();
+                    // behoud selectie
+                    selectedPatchEl = repl;
                     selPatch = patchOps.IndexOf(repl);
                 }
                 catch (Exception ex)
@@ -590,7 +655,8 @@ public class EntryXmlModule : IConfigModule
                 el.Remove();
                 dirty = true;
                 RebuildPatches();
-                selPatch = Mathf.Clamp(selPatch, 0, patchOps.Count - 1);
+                selectedPatchEl = null;
+                selPatch = -1;
             }
             GUILayout.FlexibleSpace();
             if (GUILayout.Button($"Save {fileName}", GUILayout.Width(160))) Save();
@@ -598,10 +664,10 @@ public class EntryXmlModule : IConfigModule
 
             GUILayout.EndScrollView();
             if (useArea) GUILayout.EndArea();
-            return; // Do not show entry UI when a patch is selected
+            return; // niets anders tonen wanneer een patch geselecteerd is
         }
 
-        // Entry inspector
+        // ---- ENTRY INSPECTOR ----
         if (selectedIndex < 0 || selectedIndex >= entries.Count)
         {
             GUILayout.Label($"Select a {entryTag} or a patch from the list on the left…");
@@ -611,7 +677,6 @@ public class EntryXmlModule : IConfigModule
 
         var elEntry = entries[selectedIndex];
         rightScroll = GUILayout.BeginScrollView(rightScroll);
-
 
         GUILayout.BeginVertical("box");
         // Block Name
@@ -1227,66 +1292,62 @@ public class EntryXmlModule : IConfigModule
         var el = new XElement("remove", new XAttribute("xpath", xp));
         doc.Root.AddFirst(el);
         dirty = true;
+        selectedPatchEl = el;
         RebuildPatches();
-        selPatch = patchOps.IndexOf(el);
     }
 
-
-    // EntryXmlModule.cs - updated AddSetPatch() function
     void AddSetPatch()
     {
         if (doc?.Root == null) return;
-        if (!EditorPrompt.PromptString("New <set> patch", "XPath (e.g. .../@value):", "/blocks/block[@name='solarbank']/property[@name='MaxPower']/@value", out var xp)) return;
-        if (!EditorPrompt.PromptString("New <set> patch", "Value:", "216", out var val)) return;
+        if (!EditorPrompt.PromptString("New <set> patch", "XPath (e.g. .../@value):", $"/{rootTag}/{entryTag}[@name='example']/property[@name='Max']/@value", out var xp)) return;
+        if (!EditorPrompt.PromptString("New <set> patch", "Value:", "1", out var val)) return;
         var el = new XElement("set", new XAttribute("xpath", xp)) { Value = val ?? "" };
         doc.Root.AddFirst(el);
         dirty = true;
+        selectedPatchEl = el;
         RebuildPatches();
-        selPatch = patchOps.IndexOf(el);
     }
 
-
-    // EntryXmlModule.cs - updated AddAppendPatch() function
     void AddAppendPatch()
     {
         if (doc?.Root == null) return;
+
         string def = "/" + rootTag;
         if (!EditorPrompt.PromptString("New <append> patch", "XPath:", def, out var xp)) return;
+
         var el = new XElement("append", new XAttribute("xpath", xp));
         if (!string.Equals(xp, def, StringComparison.OrdinalIgnoreCase))
             el.Add(new XComment(" Add child nodes here "));
+
         doc.Root.AddFirst(el);
         dirty = true;
-        // If this is the root append container, normalize layout and refresh entries
-        if (string.Equals(xp, def, StringComparison.OrdinalIgnoreCase))
-        {
-            NormalizeDocumentLayout();
-            RebuildEntries();
-            RebuildPatches();
-            selPatch = -1;
-        }
-        else
-        {
-            RebuildPatches();
-            selPatch = patchOps.IndexOf(el);
-        }
+
+        // selecteer alleen niet-root appends (root-append is puur container en staat niet in de lijst)
+        selectedPatchEl = string.Equals(xp, def, StringComparison.OrdinalIgnoreCase) ? null : el;
+
+        NormalizeDocumentLayout();
+        RebuildEntries();
+        RebuildPatches();
     }
 
 
     // ------------------- PATCH EDITOR -------------------
     void RebuildPatches()
     {
-        if (doc == null)
+        if (doc == null || doc.Root == null)
         {
             patchOps = new List<XElement>();
             selPatch = -1;
+            selectedPatchEl = null;
+            multiPatchSel.Clear();
             return;
         }
 
         string containerXpath = "/" + rootTag;
 
-        // Behoud originele XML volgorde, filter alleen de append-container naar rootTag
-        patchOps = doc.Root.Descendants()
+        // Show ALL patches, including the append to "/<rootTag>"
+        patchOps = doc.Root
+            .Descendants()
             .Where(e =>
                 e.Name == "set" ||
                 e.Name == "remove" ||
@@ -1294,10 +1355,8 @@ public class EntryXmlModule : IConfigModule
                  !string.Equals((string)e.Attribute("xpath"), containerXpath, StringComparison.OrdinalIgnoreCase)))
             .ToList();
 
-        // Behoud huidige selectie indien mogelijk
-        selPatch = patchOps.Count > 0 ? Mathf.Clamp(selPatch, 0, patchOps.Count - 1) : -1;
+        SyncPatchSelection();
     }
-
 
     string MakePatchLabel(XElement e)
     {
@@ -1572,27 +1631,22 @@ public class EntryXmlModule : IConfigModule
     // Zoekt een modelwaarde (Model/Meshfile) in entry of via extends-keten (eerst mod, dan base game)
     string ResolveModelValueWithExtends(XElement entry)
     {
-        // 1) Probeer op het huidige entry (inclusief nested property-groepen)
+        // 1) Probeer eerst op het entry zelf (incl. groups)
         if (TryGetModelLikeValue(entry, out var val))
             return val;
 
-        // 2) Volg extends-keten (max 12 stappen)
-        int guard = 0;
+        // 2) Volg extends-keten, maar gebruik cached base game doc + index
         string target = GetExtendsTarget(entry);
-        XDocument baseDoc = null;
+        int guard = 0;
 
         while (!string.IsNullOrEmpty(target) && guard++ < 12)
         {
             // in huidig doc
             var parent = FindEntryByName(target, doc);
-            if (parent == null && !string.IsNullOrEmpty(ctx?.GameConfigPath))
-            {
-                // in base game doc
-                string basePath = Path.Combine(ctx.GameConfigPath, fileName);
-                if (File.Exists(basePath))
-                    baseDoc ??= XDocument.Load(basePath);
-                parent = FindEntryByName(target, baseDoc);
-            }
+
+            // anders in base game (cached + O(1) lookup)
+            if (parent == null)
+                parent = FindInBaseGameByName(target);
 
             if (parent == null)
                 break;
@@ -2077,29 +2131,19 @@ public class EntryXmlModule : IConfigModule
     {
         tex = null; origin = "";
 
-        // A) Expliciete CustomIcon: alleen die naam proberen (geen fallback)
+        // A) Expliciete CustomIcon
         string iconName = GetCustomIconNameFrom(entry);
         if (!string.IsNullOrEmpty(iconName))
-        {
-            // Dit voorkomt lag terwijl je een niet-bestaand icoon intikt:
             return TryResolveIconByNameCached(iconName, $"CustomIcon '{iconName}'", out tex, out origin);
-        }
 
-        // B) Geen CustomIcon -> probeer geërfde CustomIcon via extends-keten (max 8 stappen)
+        // B) Geërfde CustomIcon via extends-keten (cached base doc + index)
         string extTarget = GetExtendsTarget(entry);
-        XDocument baseDoc = null;
+        string firstExtTarget = extTarget; // voor fallback label
         int guard = 0;
 
         while (!string.IsNullOrEmpty(extTarget) && guard++ < 8)
         {
-            var parent = FindEntryByName(extTarget, doc);
-            if (parent == null && !string.IsNullOrEmpty(ctx?.GameConfigPath))
-            {
-                string basePath = Path.Combine(ctx.GameConfigPath, fileName);
-                if (File.Exists(basePath))
-                    baseDoc ??= XDocument.Load(basePath);
-                parent = FindEntryByName(extTarget, baseDoc);
-            }
+            XElement parent = FindEntryByName(extTarget, doc) ?? FindInBaseGameByName(extTarget);
             if (parent == null) break;
 
             var parentIcon = GetCustomIconNameFrom(parent);
@@ -2111,13 +2155,13 @@ public class EntryXmlModule : IConfigModule
             extTarget = GetExtendsTarget(parent);
         }
 
-        // C) Als laatste: default game icon op basis van entry- of extends-naam
-        var candidates = new System.Collections.Generic.List<string>();
+        // C) Default game icon op basis van entry- of (eerste) extends-naam
+        var candidates = new List<string>();
         var selfName = entry.Attribute("name")?.Value;
         if (!string.IsNullOrEmpty(selfName)) candidates.Add(selfName);
-        if (!string.IsNullOrEmpty(extTarget)) candidates.Add(extTarget);
+        if (!string.IsNullOrEmpty(firstExtTarget)) candidates.Add(firstExtTarget);
 
-        foreach (var n in candidates.Distinct(System.StringComparer.OrdinalIgnoreCase))
+        foreach (var n in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             if (TryResolveIconByNameCached(n, $"Default game icon '{n}'", out tex, out origin))
                 return true;
@@ -2210,5 +2254,117 @@ public class EntryXmlModule : IConfigModule
 
         _knownNamesArr = _knownNames.OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToArray();
     }
+
+    // NEW helpers (add these in the class body)
+    void SyncPatchSelection()
+    {
+        // prune multi-select of removed nodes
+        multiPatchSel.RemoveWhere(p => !patchOps.Contains(p));
+
+        // keep main selection stable
+        if (selectedPatchEl != null)
+        {
+            int idx = patchOps.IndexOf(selectedPatchEl);
+            selPatch = (idx >= 0) ? idx : -1;
+            if (selPatch < 0) selectedPatchEl = null;
+        }
+        else
+        {
+            selectedPatchEl = (selPatch >= 0 && selPatch < patchOps.Count) ? patchOps[selPatch] : null;
+        }
+    }
+
+    void MoveSiblingGeneric(XElement el, int delta)
+    {
+        var parent = el?.Parent;
+        if (parent == null) return;
+
+        var siblings = parent.Elements().ToList();
+        int idx = siblings.IndexOf(el);
+        int newIdx = Mathf.Clamp(idx + delta, 0, siblings.Count - 1);
+        if (newIdx == idx) return;
+
+        var anchor = siblings[newIdx];
+        el.Remove();
+
+        if (newIdx < idx) anchor.AddBeforeSelf(el);
+        else anchor.AddAfterSelf(el);
+    }
+
+    void MoveSelectedPatches(int delta)
+    {
+        if (multiPatchSel.Count == 0) return;
+        var list = patchOps.Where(p => multiPatchSel.Contains(p)).ToList();
+        if (delta > 0) list.Reverse(); // move down from bottom up
+        foreach (var el in list) MoveSiblingGeneric(el, delta);
+        dirty = true;
+        RebuildPatches();
+        EditorWindow.focusedWindow?.Repaint();
+    }
+
+    void DeleteSelectedPatches()
+    {
+        if (multiPatchSel.Count == 0) return;
+        foreach (var el in patchOps.Where(p => multiPatchSel.Contains(p)).ToList())
+            el.Remove();
+
+        multiPatchSel.Clear();
+        selectedPatchEl = null;
+        selPatch = -1;
+        dirty = true;
+        RebuildPatches();
+        EditorWindow.focusedWindow?.Repaint();
+    }
+
+    void InvalidateBaseGameCaches()
+    {
+        _baseGameDoc = null;
+        _baseGameDocPath = null;
+        _baseGameIndex = null;
+    }
+
+    XDocument GetBaseGameDocCached()
+    {
+        if (_baseGameDoc != null) return _baseGameDoc;
+        if (string.IsNullOrEmpty(ctx?.GameConfigPath)) return null;
+
+        string path = Path.Combine(ctx.GameConfigPath, fileName);
+        if (!File.Exists(path)) return null;
+
+        try
+        {
+            _baseGameDoc = XDocument.Load(path);
+            _baseGameDocPath = path;
+        }
+        catch
+        {
+            _baseGameDoc = null;
+        }
+        return _baseGameDoc;
+    }
+
+    void EnsureBaseGameIndex()
+    {
+        if (_baseGameIndex != null) return;
+        var bd = GetBaseGameDocCached();
+        _baseGameIndex = new Dictionary<string, XElement>(StringComparer.OrdinalIgnoreCase);
+        if (bd?.Root == null) return;
+
+        foreach (var e in bd.Descendants(entryTag))
+        {
+            var n = (string)e.Attribute("name");
+            if (string.IsNullOrWhiteSpace(n)) continue;
+            if (!_baseGameIndex.ContainsKey(n)) _baseGameIndex[n] = e;
+        }
+    }
+
+    XElement FindInBaseGameByName(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return null;
+        EnsureBaseGameIndex();
+        _baseGameIndex.TryGetValue(name, out var el);
+        return el;
+    }
+
 
 }
