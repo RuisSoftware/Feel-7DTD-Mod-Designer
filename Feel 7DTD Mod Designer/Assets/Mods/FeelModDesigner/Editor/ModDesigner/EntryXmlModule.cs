@@ -1008,7 +1008,15 @@ public class EntryXmlModule : IConfigModule
 
     void GenerateIconsForEntries(int size, float yawDeg, float pitchDeg, bool overwrite, bool onlyWithCustomIcon)
     {
+
         if (doc == null || ctx?.ModFolder == null) return;
+
+        // Nieuw: hard stop als mod buiten Assets staat
+        if (!IsModUnderAssets())
+        {
+            WarnModNotUnderAssets("icons batch te genereren");
+            return;
+        }
 
         string atlasDir = Path.Combine(ctx.ModFolder, "XML", "UIAtlases", "ItemIconAtlas");
         Directory.CreateDirectory(atlasDir);
@@ -1049,29 +1057,18 @@ public class EntryXmlModule : IConfigModule
 
                 EditorUtility.DisplayProgressBar("Generating icons", $"{entryName}  ({i + 1}/{targets.Count})", (float)(i + 1) / targets.Count);
 
-                // Prefab vinden via Model-property
-                string prefabName;
-                var prefab = FindPrefabFromModel(entry, out prefabName);
-                if (prefab == null)
-                {
-                    failed++;
-                    sbLog.AppendLine($"[MISS PREFAB] {entryName} (Model niet gevonden)");
-                    continue;
-                }
-
-                // Iconnaam bepalen
+                // Iconnaam bepalen (vul hem desnoods in)
                 string iconName = GetCustomIconNameFrom(entry);
                 if (string.IsNullOrWhiteSpace(iconName))
                 {
-                    // Alleen vullen als we niet beperken op 'alleen met CustomIcon'
                     if (onlyWithCustomIcon)
                     {
                         skipped++;
                         sbLog.AppendLine($"[SKIP NO ICON] {entryName} (geen CustomIcon)");
                         continue;
                     }
+
                     iconName = entryName; // fallback
-                                          // Schrijf 'm weg zodat UI consistent blijft
                     entry.Add(new XElement("property", new XAttribute("name", "CustomIcon"), new XAttribute("value", iconName)));
                     dirty = true;
                 }
@@ -1084,16 +1081,35 @@ public class EntryXmlModule : IConfigModule
                     continue;
                 }
 
-                bool ok = ScreenshotPrefabs.TryMakePrefabIcon(prefab, outPng, size, yawDeg, pitchDeg);
-                if (ok)
-                {
-                    done++;
-                    sbLog.AppendLine($"[OK] {entryName} -> {iconName}.png");
-                }
-                else
+                // Prefab klaarzetten (asset of tijdelijke import)
+                string tempShotAsset = null;
+                string sourceInfo = null;
+                var prefab = LoadPrefabForScreenshot(entry, out tempShotAsset, out sourceInfo);
+                if (prefab == null)
                 {
                     failed++;
-                    sbLog.AppendLine($"[FAIL] {entryName} -> {iconName}.png");
+                    sbLog.AppendLine($"[MISS PREFAB] {entryName} (Model niet gevonden)");
+                    continue;
+                }
+
+                try
+                {
+                    bool ok = ScreenshotPrefabs.TryMakePrefabIcon(prefab, outPng, size, yawDeg, pitchDeg);
+                    if (ok)
+                    {
+                        done++;
+                        sbLog.AppendLine($"[OK] {entryName} -> {iconName}.png");
+                    }
+                    else
+                    {
+                        failed++;
+                        sbLog.AppendLine($"[FAIL] {entryName} -> {iconName}.png");
+                    }
+                }
+                finally
+                {
+                    if (!string.IsNullOrEmpty(tempShotAsset))
+                        CleanupTempImported(tempShotAsset);
                 }
             }
         }
@@ -1102,26 +1118,18 @@ public class EntryXmlModule : IConfigModule
             EditorUtility.ClearProgressBar();
         }
 
-        // Eventueel localization/icon-props wegschrijven
         Save();
         ClearIconCache();
 
-        string summary =
-            $"Total: {targets.Count}\n" +
-            $"Generated: {done}\n" +
-            $"Skipped: {skipped}\n" +
-            $"Failed: {failed}\n\n" +
-            $"Icons folder:\n{atlasDir}\n\n" +
-            $"Details:\n{sbLog}";
+        Debug.Log(
+            $"Total: {targets.Count}\nGenerated: {done}\nSkipped: {skipped}\nFailed: {failed}\n\n" +
+            $"Icons folder:\n{atlasDir}\n\nDetails:\n{sbLog}");
 
-        // Toon compacte samenvatting; volledige log in console
-        Debug.Log(summary);
         EditorUtility.DisplayDialog("Batch icons complete", $"Generated: {done}\nSkipped: {skipped}\nFailed: {failed}", "OK");
-
-        // Refresh UI
         AssetDatabase.Refresh();
         EditorWindow.focusedWindow?.Repaint();
     }
+
 
 
     void DrawPropertyList(List<XElement> list, XElement parent)
@@ -1726,44 +1734,6 @@ public class EntryXmlModule : IConfigModule
         return null;
     }
 
-    // ---- Prefab resolving helpers (asset or external file) ----
-    bool TryFindPrefabAssetOrExternalPath(XElement entry, out GameObject prefabAsset, out string externalPath, out string prefabName)
-    {
-        prefabAsset = null; externalPath = null; prefabName = null;
-
-        // 1) Eerst: probeer als echte Asset (via bestaande zoeklogica)
-        prefabAsset = FindPrefabFromModel(entry, out prefabName);
-        if (prefabAsset != null) return true;
-
-        // 2) Model/Meshfile -> short prefab name
-        string modelVal = ResolveModelValueWithExtends(entry);
-        string shortName = ExtractPrefabName(modelVal);
-        if (string.IsNullOrEmpty(shortName) || string.IsNullOrEmpty(ctx?.ModFolder)) return false;
-        prefabName = shortName;
-
-        // 3) Zoek fysieke .prefab onder <ModFolder>/Prefabs (ook als mod buiten Assets staat)
-        try
-        {
-            string prefabsFolder = System.IO.Path.Combine(ctx.ModFolder, "Prefabs");
-            if (Directory.Exists(prefabsFolder))
-            {
-                // eerst exact, dan bevat
-                string exact = Directory
-                    .GetFiles(prefabsFolder, shortName + ".prefab", SearchOption.AllDirectories)
-                    .FirstOrDefault();
-                if (!string.IsNullOrEmpty(exact)) { externalPath = exact.Replace('\\', '/'); return true; }
-
-                string contains = Directory
-                    .GetFiles(prefabsFolder, "*" + shortName + "*.prefab", SearchOption.AllDirectories)
-                    .FirstOrDefault();
-                if (!string.IsNullOrEmpty(contains)) { externalPath = contains.Replace('\\', '/'); return true; }
-            }
-        }
-        catch { /* ignore */ }
-
-        return false;
-    }
-
     // Importeer een externe .prefab als kopie in het project, zodat je ‘m kunt selecteren.
     string ImportExternalPrefabIntoProject(string sourceFile)
     {
@@ -1899,47 +1869,34 @@ public class EntryXmlModule : IConfigModule
             return;
         }
 
-        // 1) Find prefab based on Model property, or ask user to pick one
-        string prefabName;
-        GameObject prefab = FindPrefabFromModel(entry, out prefabName);
-        if (prefab == null)
+        // Afdwingen: mod moet onder Assets staan
+        if (!IsModUnderAssets())
         {
-            if (!EditorUtility.DisplayDialog("Prefab not found",
-                "No prefab was found via the Model property.\nChoose a prefab manually?", "Choose...", "Cancel"))
-                return;
-            string picked = EditorUtility.OpenFilePanel("Select prefab", Path.Combine(ctx.ModFolder, "Prefabs"), "prefab");
-            if (string.IsNullOrEmpty(picked)) return;
-            string assetPath = ModDesignerWindow.SystemPathToAssetPath(picked);
-            prefab = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
-            if (prefab == null)
-            {
-                EditorUtility.DisplayDialog("Load failed", "Could not load prefab.", "OK");
-                return;
-            }
-            prefabName = Path.GetFileNameWithoutExtension(picked);
+            WarnModNotUnderAssets();
+            return;
         }
 
-        // 2) Determine icon file name (default = existing CustomIcon -> entry name)
+        // Alleen een bestaande Asset-prefab wordt geaccepteerd
+        string tempShotAsset;
+        string sourceInfo;
+        var prefab = LoadPrefabForScreenshot(entry, out tempShotAsset, out sourceInfo);
+        if (prefab == null) return; // melding is al getoond door LoadPrefabForScreenshot
+
+        // Bepaal icon-naam (zoals voorheen)
         string existingCustom = GetCustomIconNameFrom(entry);
         string defaultIconName = !string.IsNullOrEmpty(existingCustom)
             ? existingCustom
-            : (entry.Attribute("name")?.Value ?? prefabName ?? prefab.name);
+            : (entry.Attribute("name")?.Value ?? prefab.name);
 
         if (!EditorPrompt.PromptString("Icon file name", "Name (without .png):", defaultIconName, out string iconName))
             return;
 
-        // 3) Determine output folder for icon
         string atlasDir = Path.Combine(ctx.ModFolder, "XML", "UIAtlases", "ItemIconAtlas");
         Directory.CreateDirectory(atlasDir);
         string outPng = Path.Combine(atlasDir, iconName + ".png");
 
-        // 4) Generate screenshot
-        // Gebruik de UI-instellingen van deze module (zelfde als batch)
+        // Respecteer overwrite-toggle
         int size = Mathf.Clamp(batchIconSize, 32, 2048);
-        float yaw = batchYaw;
-        float pitch = batchPitch;
-
-        // Optioneel: respecteer ook de overwrite toggle van batch (handig en verwacht)
         if (!batchOverwrite && File.Exists(outPng))
         {
             EditorUtility.DisplayDialog("Icon bestaat al",
@@ -1948,32 +1905,27 @@ public class EntryXmlModule : IConfigModule
             return;
         }
 
-        bool ok = ScreenshotPrefabs.TryMakePrefabIcon(prefab, outPng, size, yaw, pitch);
-
+        bool ok = ScreenshotPrefabs.TryMakePrefabIcon(prefab, outPng, size, batchYaw, batchPitch);
         if (!ok)
         {
             EditorUtility.DisplayDialog("Failed", "Screenshot could not be taken.", "OK");
             return;
         }
 
-        // 5) Set or create CustomIcon property
+        // Schrijf/actualiseer CustomIcon property
         var iconProp = entry.Elements("property").FirstOrDefault(p => (string)p.Attribute("name") == "CustomIcon");
         if (iconProp == null)
-        {
-            iconProp = new XElement("property", new XAttribute("name", "CustomIcon"), new XAttribute("value", iconName));
-            entry.Add(iconProp);
-        }
+            entry.Add(new XElement("property", new XAttribute("name", "CustomIcon"), new XAttribute("value", iconName)));
         else
-        {
             iconProp.SetAttributeValue("value", iconName);
-        }
 
-        ClearIconCache(iconName);   // zorg dat preview meteen je nieuwe PNG ziet
         dirty = true;
+        ClearIconCache(iconName);
         AssetDatabase.Refresh();
         EditorUtility.DisplayDialog("Success",
-            $"Icon saved to:\n{outPng}\n\nCustomIcon has been set to '{iconName}'.", "OK");
+            $"Icon saved to:\n{outPng}\n\nCustomIcon is set to '{iconName}'.", "OK");
     }
+
 
 
     // ========= EntryXmlModule: Localization UI helpers =========
@@ -2524,6 +2476,178 @@ public class EntryXmlModule : IConfigModule
         EnsureBaseGameIndex();
         _baseGameIndex.TryGetValue(name, out var el);
         return el;
+    }
+
+    // === External prefab import for screenshots ===
+
+    // Vind prefab als Asset of fysiek pad; al aanwezig via je eerdere patch:
+    bool TryFindPrefabAssetOrExternalPath(XElement entry, out GameObject prefabAsset, out string externalPath, out string prefabName)
+    {
+        prefabAsset = null; externalPath = null; prefabName = null;
+
+        // 1) Eerst: probeer als echte Asset (via bestaande zoeklogica)
+        prefabAsset = FindPrefabFromModel(entry, out prefabName);
+        if (prefabAsset != null) return true;
+
+        // 2) Model/Meshfile -> short prefab name
+        string modelVal = ResolveModelValueWithExtends(entry);
+        string shortName = ExtractPrefabName(modelVal);
+        if (string.IsNullOrEmpty(shortName) || string.IsNullOrEmpty(ctx?.ModFolder)) return false;
+        prefabName = shortName;
+
+        // 3) Zoek fysieke .prefab onder <ModFolder>/Prefabs (ook als mod buiten Assets staat)
+        try
+        {
+            string prefabsFolder = System.IO.Path.Combine(ctx.ModFolder, "Prefabs");
+            if (Directory.Exists(prefabsFolder))
+            {
+                // eerst exact, dan bevat
+                string exact = Directory
+                    .GetFiles(prefabsFolder, shortName + ".prefab", SearchOption.AllDirectories)
+                    .FirstOrDefault();
+                if (!string.IsNullOrEmpty(exact)) { externalPath = exact.Replace('\\', '/'); return true; }
+
+                string contains = Directory
+                    .GetFiles(prefabsFolder, "*" + shortName + "*.prefab", SearchOption.AllDirectories)
+                    .FirstOrDefault();
+                if (!string.IsNullOrEmpty(contains)) { externalPath = contains.Replace('\\', '/'); return true; }
+            }
+        }
+        catch { /* ignore */ }
+
+        return false;
+    }
+
+    // Map-copy voor dependencies: kopieer de map van de prefab (relatief t.o.v. <ModFolder>/Prefabs)
+    string ImportExternalPrefabTreeForScreenshot(string sourcePrefabFile)
+    {
+        string modNameSafe = Regex.Replace(ctx?.ModName ?? "Mod", @"[^A-Za-z0-9_\-\. ]", "_");
+        string tempRoot = Path.Combine("Assets", "_TempShots", modNameSafe, "Prefabs");
+
+        // Herleid relatief pad onder ModFolder/Prefabs zodat referenties werken
+        string prefabsRoot = Path.Combine(ctx.ModFolder, "Prefabs");
+        string sourceDir = Path.GetDirectoryName(sourcePrefabFile) ?? "";
+        string relDir;
+        try
+        {
+#if UNITY_2021_2_OR_NEWER
+            relDir = Path.GetRelativePath(prefabsRoot, sourceDir);
+#else
+        Uri u1 = new Uri(prefabsRoot.EndsWith(Path.DirectorySeparatorChar.ToString()) ? prefabsRoot : prefabsRoot + Path.DirectorySeparatorChar);
+        Uri u2 = new Uri(sourceDir);
+        relDir = Uri.UnescapeDataString(u1.MakeRelativeUri(u2).ToString()).Replace('/', Path.DirectorySeparatorChar);
+#endif
+        }
+        catch { relDir = ""; }
+
+        string destDir = Path.Combine(tempRoot, relDir);
+        CopyDirectoryWithoutMeta(sourceDir, destDir);
+
+        // Geef het Asset-pad terug voor de prefab zelf
+        string destPrefab = Path.Combine(destDir, Path.GetFileName(sourcePrefabFile)).Replace('\\', '/');
+        AssetDatabase.ImportAsset(destPrefab, ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
+        return destPrefab;
+    }
+
+    // Simpele directory copy (zonder .meta-bestanden)
+    void CopyDirectoryWithoutMeta(string sourceDir, string destDir)
+    {
+        Directory.CreateDirectory(destDir);
+        foreach (string file in Directory.GetFiles(sourceDir))
+        {
+            if (string.Equals(Path.GetExtension(file), ".meta", StringComparison.OrdinalIgnoreCase)) continue;
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(destDir, Path.GetFileName(file))) ?? destDir);
+            File.Copy(file, Path.Combine(destDir, Path.GetFileName(file)), true);
+        }
+        foreach (string sub in Directory.GetDirectories(sourceDir))
+        {
+            string name = Path.GetFileName(sub);
+            CopyDirectoryWithoutMeta(sub, Path.Combine(destDir, name));
+        }
+    }
+
+    // Laad prefab voor screenshot: retourneert Asset (kan tijdelijk geïmporteerd zijn)
+    // Laad prefab voor screenshot: alleen als echte Asset onder Assets/.
+    // GEEN import of tijdelijk kopiëren meer.
+    GameObject LoadPrefabForScreenshot(XElement entry, out string tempAssetToCleanup, out string sourceHint)
+    {
+        tempAssetToCleanup = null;
+        sourceHint = null;
+
+        // Afdwingen dat de mod zelf onder Assets staat
+        if (!IsModUnderAssets())
+        {
+            WarnModNotUnderAssets();
+            return null;
+        }
+
+        // Zoek uitsluitend een prefab die als Asset bestaat
+        var prefab = FindPrefabFromModel(entry, out _);
+        if (prefab != null)
+        {
+            sourceHint = AssetDatabase.GetAssetPath(prefab);
+            return prefab;
+        }
+
+        // Als we hier komen: geen Asset gevonden (dus extern/buiten Assets of ontbrekend)
+        EditorUtility.DisplayDialog(
+            "Prefab niet gevonden in Assets",
+            "Voor icon-generatie moet de prefab als Asset in je project staan " +
+            "(bijvoorbeeld onder 'Assets/Mods/<ModName>/Prefabs').\n\n" +
+            "Zorg dat je mod root en prefabs binnen Assets staan en probeer opnieuw.",
+            "OK"
+        );
+        return null;
+    }
+
+
+    // Opruimen van tijdelijke import (prefab + lege mappen)
+    void CleanupTempImported(string assetPath)
+    {
+        if (string.IsNullOrEmpty(assetPath)) return;
+
+        // Verwijder het prefab asset
+        AssetDatabase.DeleteAsset(assetPath);
+
+        // Ruim lege mapstructuur onder Assets/_TempShots op
+        string dir = Path.GetDirectoryName(assetPath)?.Replace('\\', '/');
+        while (!string.IsNullOrEmpty(dir) &&
+               (dir.EndsWith("/Prefabs") || dir.Contains("/_TempShots/")))
+        {
+            // Stop bij de _TempShots root
+            if (dir.Equals("Assets/_TempShots", StringComparison.OrdinalIgnoreCase)) break;
+
+            // Als directory leeg (op .meta na), verwijder
+            bool hasNonMeta = Directory.Exists(dir) &&
+                Directory.EnumerateFileSystemEntries(dir).Any(p => !p.EndsWith(".meta", StringComparison.OrdinalIgnoreCase));
+
+            if (hasNonMeta) break;
+
+            FileUtil.DeleteFileOrDirectory(dir);
+            FileUtil.DeleteFileOrDirectory(dir + ".meta");
+            dir = Path.GetDirectoryName(dir)?.Replace('\\', '/');
+        }
+        AssetDatabase.Refresh();
+    }
+
+    // --- Helpers: mod-locatie afdwingen voor icon-workflow ---
+    bool IsModUnderAssets()
+    {
+        string mod = (ctx?.ModFolder ?? "").Replace('\\', '/');
+        string assets = Application.dataPath.Replace('\\', '/');
+        return !string.IsNullOrEmpty(mod) &&
+               mod.StartsWith(assets, StringComparison.OrdinalIgnoreCase);
+    }
+
+    void WarnModNotUnderAssets(string reason = "icons te genereren")
+    {
+        EditorUtility.DisplayDialog(
+            "Mod staat buiten Assets",
+            $"Om {reason} moet de mod-root binnen de Unity project Assets staan.\n\n" +
+            $"Verplaats je mod naar bijvoorbeeld:\n  Assets/Mods/{ctx?.ModName}\n\n" +
+            $"Huidige mod-locatie:\n{ctx?.ModFolder}",
+            "OK"
+        );
     }
 
 
