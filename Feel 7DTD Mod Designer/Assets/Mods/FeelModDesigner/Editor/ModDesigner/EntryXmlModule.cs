@@ -50,6 +50,8 @@ public class EntryXmlModule : IConfigModule
 
     private GUIStyle patchLabelStyle;
     private Color patchSelectedColor = new Color(1f, 0.6f, 0.2f, 0.35f);
+    private XElement _patchEditorBoundEl = null;
+    private string _patchEditorText = "";
 
     HashSet<string> _knownNames = new(StringComparer.OrdinalIgnoreCase);
     HashSet<string> _knownItems = new(StringComparer.OrdinalIgnoreCase);
@@ -405,7 +407,7 @@ public class EntryXmlModule : IConfigModule
         GUILayout.Space(4);
         GUILayout.Label("Patches (set / append / remove)", EditorStyles.boldLabel);
 
-        RebuildPatches();
+        //RebuildPatches();
 
         EditorGUILayout.BeginHorizontal();
         if (GUILayout.Button("Normalize layout", GUILayout.Width(140)))
@@ -479,13 +481,19 @@ public class EntryXmlModule : IConfigModule
                 rowRect.Contains(Event.current.mousePosition) &&
                 !checkRect.Contains(Event.current.mousePosition))
             {
-                // <<< BELANGRIJK: deselecteer entry zodat patch-editor zichtbaar wordt >>>
+                // activeer patch editor
                 selectedIndex = -1;
                 selectedPatchEl = patch;
                 selPatch = i;
+
+                // <<< NIEUW: forceer (her)laden van de editorbuffer >>>
+                _patchEditorBoundEl = null;
+                _patchEditorText = "";
+
                 GUI.FocusControl(null);
                 EditorWindow.focusedWindow?.Repaint();
-                Event.current.Use();
+
+                // BELANGRIJK: niet Event.current.Use(); laten bubbelen voorkomt 'niet meer kunnen klikken'
             }
         }
 
@@ -623,27 +631,39 @@ public class EntryXmlModule : IConfigModule
 
             EditorGUILayout.LabelField($"Patch: <{el.Name.LocalName}>", EditorStyles.boldLabel);
 
-            string raw = el.ToString(SaveOptions.None);
+            // <<< NIEUW: éénmalig tekst bufferen per geselecteerd element >>>
+            if (_patchEditorBoundEl != el)
+            {
+                _patchEditorBoundEl = el;
+                _patchEditorText = el.ToString(SaveOptions.None);
+            }
+
+            // Stijl
             var xmlStyle = new GUIStyle(EditorStyles.textArea) { wordWrap = true };
             Font codeFont = Font.CreateDynamicFontFromOSFont(
                 new string[] { "Consolas", "Courier New", "Lucida Console", "Menlo", "Monaco" }, 12);
             if (codeFont) xmlStyle.font = codeFont;
             xmlStyle.richText = false;
 
-            string changed = EditorGUILayout.TextArea(raw, xmlStyle, GUILayout.ExpandHeight(true), GUILayout.MinHeight(240));
+            // <<< BELANGRIJK: bind TextArea aan buffer, niet aan el.ToString(...) elke frame >>>
+            _patchEditorText = EditorGUILayout.TextArea(
+                _patchEditorText, xmlStyle, GUILayout.ExpandHeight(true), GUILayout.MinHeight(240));
 
             EditorGUILayout.BeginHorizontal();
             if (GUILayout.Button("Apply", GUILayout.Width(90)))
             {
                 try
                 {
-                    var repl = XElement.Parse(changed);
+                    var repl = XElement.Parse(_patchEditorText);
                     el.ReplaceWith(repl);
                     dirty = true;
                     RebuildPatches();
-                    // behoud selectie
+
+                    // selectie & buffer updaten naar de nieuwe node
                     selectedPatchEl = repl;
                     selPatch = patchOps.IndexOf(repl);
+                    _patchEditorBoundEl = repl;
+                    _patchEditorText = repl.ToString(SaveOptions.None);
                 }
                 catch (Exception ex)
                 {
@@ -655,8 +675,12 @@ public class EntryXmlModule : IConfigModule
                 el.Remove();
                 dirty = true;
                 RebuildPatches();
+
+                // buffer leegmaken
                 selectedPatchEl = null;
                 selPatch = -1;
+                _patchEditorBoundEl = null;
+                _patchEditorText = "";
             }
             GUILayout.FlexibleSpace();
             if (GUILayout.Button($"Save {fileName}", GUILayout.Width(160))) Save();
@@ -1354,6 +1378,14 @@ public class EntryXmlModule : IConfigModule
                 (e.Name == "append" &&
                  !string.Equals((string)e.Attribute("xpath"), containerXpath, StringComparison.OrdinalIgnoreCase)))
             .ToList();
+
+        // houd buffer consistent
+        if (selectedPatchEl != null && !patchOps.Contains(selectedPatchEl))
+        {
+            // behoud selectie op index waar mogelijk
+            if (selPatch >= 0 && selPatch < patchOps.Count) selectedPatchEl = patchOps[selPatch];
+            else { selectedPatchEl = null; selPatch = -1; }
+        }
 
         SyncPatchSelection();
     }
