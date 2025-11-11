@@ -1,5 +1,3 @@
-// Assets/Editor/IConfigModule.cs
-using System.Collections.Generic;
 using UnityEngine;
 
 public interface IConfigModule
