@@ -88,6 +88,16 @@ A Unity editor toolkit to **create, inspect, and ship** mods for *7 Days to Die 
 
 ---
 
+## To-do
+- Version control for mods you create. (local or with Github API?)
+- Support for in-scene prefab creating with automatic XML generation.
+- Support for animations and audio on custom prefabs
+- Support for Mac and Linux, currently only tested on Windows
+- Create a wiki and add more intuïtive tooltips
+- Expand the support for specific Patches XML properties
+
+---
+
 ## Known Issues
 - This is still in development. If you hit crashes or odd behavior, please open an issue.
 - Include logs, Unity version, game version, and steps to reproduce.
