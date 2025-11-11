@@ -50,8 +50,12 @@ public class EntryXmlModule : IConfigModule
 
     private GUIStyle patchLabelStyle;
     private Color patchSelectedColor = new Color(1f, 0.6f, 0.2f, 0.35f);
-    private XElement _patchEditorBoundEl = null;
-    private string _patchEditorText = "";
+    // === Static cached font & style voor XML-editor ===
+    static readonly string[] kCodeFontCandidates = { "Consolas", "Courier New", "Lucida Console", "Menlo", "Monaco" };
+    static Font s_CodeFont;
+    static GUIStyle s_XmlTextAreaStyle;
+    static bool s_FontHooked;
+
 
     HashSet<string> _knownNames = new(StringComparer.OrdinalIgnoreCase);
     HashSet<string> _knownItems = new(StringComparer.OrdinalIgnoreCase);
@@ -110,6 +114,60 @@ public class EntryXmlModule : IConfigModule
         this.entryTag = entryTag;
         this.rootTag = rootTagOverride ?? Path.GetFileNameWithoutExtension(fileName);
     }
+
+    static void EnsureCodeFont()
+    {
+        if (s_CodeFont == null)
+        {
+            try
+            {
+                s_CodeFont = Font.CreateDynamicFontFromOSFont(kCodeFontCandidates, 12);
+                if (s_CodeFont != null) s_CodeFont.hideFlags = HideFlags.DontSave;
+            }
+            catch { /* laat fallback op default font */ }
+        }
+        if (!s_FontHooked)
+        {
+            Font.textureRebuilt += OnFontRebuilt;
+            s_FontHooked = true;
+        }
+    }
+
+    static void OnFontRebuilt(Font f)
+    {
+        // Zorg dat het veld opnieuw getekend wordt zodra de atlas is herbouwd
+        EditorApplication.delayCall += () => EditorWindow.focusedWindow?.Repaint();
+    }
+
+    GUIStyle GetXmlTextAreaStyle()
+    {
+        if (s_XmlTextAreaStyle != null) return s_XmlTextAreaStyle;
+
+        EnsureCodeFont();
+
+        var st = new GUIStyle(EditorStyles.textArea)
+        {
+            wordWrap = true,
+            richText = false,
+            font = s_CodeFont ?? EditorStyles.textArea.font,
+            alignment = TextAnchor.UpperLeft
+        };
+
+        // Forceer zichtbare tekstkleur in alle skins (Pro/Personal) en states
+        Color baseCol = EditorStyles.label.normal.textColor;
+        st.normal.textColor = baseCol;
+        st.active.textColor = baseCol;
+        st.focused.textColor = baseCol;
+        st.hover.textColor = baseCol;
+        st.onNormal.textColor = baseCol;
+        st.onActive.textColor = baseCol;
+        st.onFocused.textColor = baseCol;
+        st.onHover.textColor = baseCol;
+
+        s_XmlTextAreaStyle = st;
+        return s_XmlTextAreaStyle;
+    }
+
 
     public void Initialize(ModContext ctx)
     {
@@ -407,7 +465,7 @@ public class EntryXmlModule : IConfigModule
         GUILayout.Space(4);
         GUILayout.Label("Patches (set / append / remove)", EditorStyles.boldLabel);
 
-        //RebuildPatches();
+        RebuildPatches();
 
         EditorGUILayout.BeginHorizontal();
         if (GUILayout.Button("Normalize layout", GUILayout.Width(140)))
@@ -481,19 +539,13 @@ public class EntryXmlModule : IConfigModule
                 rowRect.Contains(Event.current.mousePosition) &&
                 !checkRect.Contains(Event.current.mousePosition))
             {
-                // activeer patch editor
+                // <<< BELANGRIJK: deselecteer entry zodat patch-editor zichtbaar wordt >>>
                 selectedIndex = -1;
                 selectedPatchEl = patch;
                 selPatch = i;
-
-                // <<< NIEUW: forceer (her)laden van de editorbuffer >>>
-                _patchEditorBoundEl = null;
-                _patchEditorText = "";
-
                 GUI.FocusControl(null);
                 EditorWindow.focusedWindow?.Repaint();
-
-                // BELANGRIJK: niet Event.current.Use(); laten bubbelen voorkomt 'niet meer kunnen klikken'
+                Event.current.Use();
             }
         }
 
@@ -631,39 +683,37 @@ public class EntryXmlModule : IConfigModule
 
             EditorGUILayout.LabelField($"Patch: <{el.Name.LocalName}>", EditorStyles.boldLabel);
 
-            // <<< NIEUW: éénmalig tekst bufferen per geselecteerd element >>>
-            if (_patchEditorBoundEl != el)
-            {
-                _patchEditorBoundEl = el;
-                _patchEditorText = el.ToString(SaveOptions.None);
-            }
+            string raw = el.ToString(SaveOptions.None);
+            var xmlStyle = GetXmlTextAreaStyle();
 
-            // Stijl
-            var xmlStyle = new GUIStyle(EditorStyles.textArea) { wordWrap = true };
-            Font codeFont = Font.CreateDynamicFontFromOSFont(
-                new string[] { "Consolas", "Courier New", "Lucida Console", "Menlo", "Monaco" }, 12);
-            if (codeFont) xmlStyle.font = codeFont;
-            xmlStyle.richText = false;
+            // Safety: zorg dat eerdere GUI-kleuren (alpha!) niet doorsijpelen
+            var prevCol = GUI.color;
+            var prevCC = GUI.contentColor;
+            var prevBG = GUI.backgroundColor;
+            GUI.color = Color.white;
+            GUI.contentColor = Color.white;
+            GUI.backgroundColor = Color.white;
 
-            // <<< BELANGRIJK: bind TextArea aan buffer, niet aan el.ToString(...) elke frame >>>
-            _patchEditorText = EditorGUILayout.TextArea(
-                _patchEditorText, xmlStyle, GUILayout.ExpandHeight(true), GUILayout.MinHeight(240));
+            string changed = EditorGUILayout.TextArea(raw, xmlStyle,
+                GUILayout.ExpandHeight(true), GUILayout.MinHeight(240));
+
+            GUI.color = prevCol;
+            GUI.contentColor = prevCC;
+            GUI.backgroundColor = prevBG;
+
 
             EditorGUILayout.BeginHorizontal();
             if (GUILayout.Button("Apply", GUILayout.Width(90)))
             {
                 try
                 {
-                    var repl = XElement.Parse(_patchEditorText);
+                    var repl = XElement.Parse(changed);
                     el.ReplaceWith(repl);
                     dirty = true;
                     RebuildPatches();
-
-                    // selectie & buffer updaten naar de nieuwe node
+                    // behoud selectie
                     selectedPatchEl = repl;
                     selPatch = patchOps.IndexOf(repl);
-                    _patchEditorBoundEl = repl;
-                    _patchEditorText = repl.ToString(SaveOptions.None);
                 }
                 catch (Exception ex)
                 {
@@ -675,12 +725,8 @@ public class EntryXmlModule : IConfigModule
                 el.Remove();
                 dirty = true;
                 RebuildPatches();
-
-                // buffer leegmaken
                 selectedPatchEl = null;
                 selPatch = -1;
-                _patchEditorBoundEl = null;
-                _patchEditorText = "";
             }
             GUILayout.FlexibleSpace();
             if (GUILayout.Button($"Save {fileName}", GUILayout.Width(160))) Save();
@@ -1379,14 +1425,6 @@ public class EntryXmlModule : IConfigModule
                  !string.Equals((string)e.Attribute("xpath"), containerXpath, StringComparison.OrdinalIgnoreCase)))
             .ToList();
 
-        // houd buffer consistent
-        if (selectedPatchEl != null && !patchOps.Contains(selectedPatchEl))
-        {
-            // behoud selectie op index waar mogelijk
-            if (selPatch >= 0 && selPatch < patchOps.Count) selectedPatchEl = patchOps[selPatch];
-            else { selectedPatchEl = null; selPatch = -1; }
-        }
-
         SyncPatchSelection();
     }
 
@@ -1445,13 +1483,16 @@ public class EntryXmlModule : IConfigModule
         {
             var el = patchOps[selPatch];
             string raw = el.ToString(SaveOptions.None);
-            var xmlStyle = new GUIStyle(EditorStyles.textArea) { wordWrap = true };
-            Font codeFont = Font.CreateDynamicFontFromOSFont(new string[] { "Consolas", "Courier New", "Lucida Console", "Menlo", "Monaco" }, 12);
-            if (codeFont) xmlStyle.font = codeFont;
-            xmlStyle.richText = false;
+            var xmlStyle = GetXmlTextAreaStyle();
+            var prevCol = GUI.color;
+            var prevCC = GUI.contentColor;
+            var prevBG = GUI.backgroundColor;
+            GUI.color = GUI.contentColor = GUI.backgroundColor = Color.white;
 
-            EditorGUILayout.LabelField($"<{el.Name.LocalName}>", EditorStyles.boldLabel);
-            string changed = EditorGUILayout.TextArea(raw, xmlStyle, GUILayout.ExpandHeight(true), GUILayout.MinHeight(240));
+            string changed = EditorGUILayout.TextArea(raw, xmlStyle,
+                GUILayout.ExpandHeight(true), GUILayout.MinHeight(240));
+
+            GUI.color = prevCol; GUI.contentColor = prevCC; GUI.backgroundColor = prevBG;
 
             EditorGUILayout.BeginHorizontal();
             if (GUILayout.Button("Apply"))
