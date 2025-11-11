@@ -1,0 +1,9 @@
+<config>
+	<set xpath="/entity_classes/entity_class[contains(@name, 'zombie')]/property[@name='LootDropProb']/@value">0.25</set>
+	<set xpath="/entity_classes/entity_class[@name='zombieWightFeral']/property[@name='LootDropProb']/@value">0.25</set>
+	<set xpath="/entity_classes/entity_class[contains(@name, 'Radiated')]/property[@name='LootDropProb']/@value">0.25</set>
+	<set xpath="/entity_classes/entity_class[contains(@name, 'Feral')]/property[@name='LootDropProb']/@value">0.25</set>
+	<set xpath="/entity_classes/entity_class[starts-with(@name, 'zombieTemplate')]/property[@name='LootDropProb']/@value">0.25</set>
+	<set xpath="/entity_classes/entity_class[@name='DroppedLootContainer']/property[@name='TimeStayAfterDeath']/@value">1800</set>
+	<set xpath="/entity_classes/entity_class[contains(@name, 'EntityLoot')]/property[@name='TimeStayAfterDeath']/@value">1800</set>
+</config>

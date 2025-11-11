@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<xml>
+  <Name value="feel-pallets" />
+  <DisplayName value="Feel - Pallets" />
+  <Description value="Pallets Addon for feel-core" />
+  <Author value="Geoffrey Ruis" />
+  <Version value="2.4.1.5" />
+  <!-- GAME.GAME.MOD.MOD -->
+  <Website value="https://next.nexusmods.com/profile/GeoffreyRuis/" />
+</xml>

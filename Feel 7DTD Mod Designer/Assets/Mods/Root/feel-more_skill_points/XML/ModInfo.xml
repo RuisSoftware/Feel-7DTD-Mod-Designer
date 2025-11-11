@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<xml>
+  <Name value="feel-skill_points" />
+  <DisplayName value="Feel - Skill Points" />
+  <Description value="Increased skill points per level." />
+  <Version value="2.4.1.2" />
+  <!-- GAME.GAME.MOD.MOD -->
+  <Author value="Geoffrey Ruis" />
+  <Website value="https://next.nexusmods.com/profile/GeoffreyRuis/" />
+</xml>
