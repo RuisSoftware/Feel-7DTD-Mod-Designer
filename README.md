@@ -95,6 +95,8 @@ A Unity editor toolkit to **create, inspect, and ship** mods for *7 Days to Die 
 - Support for Mac and Linux, currently only tested on Windows
 - Create a wiki and add more intuïtive tooltips
 - Expand the support for specific Patches XML properties
+- Quest builder: create custom quests
+- Item stack editor: create custom stacks mod
 
 ---
 
