@@ -239,6 +239,11 @@ public class RecipeConfigModule : IConfigModule
             return;
         }
 
+        if (ctx?.IsVersionLocked == true)
+        {
+            EditorGUILayout.HelpBox($"Game version '{ctx.SelectedGameVersion}' is LOCKED. Editing is disabled.", MessageType.Warning);
+        }
+
         // Search + reload
         EditorGUILayout.BeginHorizontal();
         search = EditorGUILayout.TextField(search, (GUIStyle)"SearchTextField");
@@ -252,52 +257,55 @@ public class RecipeConfigModule : IConfigModule
         }
         EditorGUILayout.EndHorizontal();
 
-        // Buttons
-        EditorGUILayout.BeginHorizontal();
-        if (GUILayout.Button("+ New"))
+        using (new EditorGUI.DisabledGroupScope(ctx?.IsVersionLocked == true))
         {
-            var menu = new GenericMenu();
-            menu.AddItem(new GUIContent("New Recipe"), false, () =>
+            // Buttons
+            EditorGUILayout.BeginHorizontal();
+            if (GUILayout.Button("+ New"))
             {
-                if (doc == null && !EnsureDocumentCreated()) return;
-                if (!EditorPrompt.PromptString("New recipe", "Name:", "newRecipe", out var nm)) return;
-
-                XElement parent = (doc.Root!.Name.LocalName == "recipes") ? doc.Root : EnsureAppendParent(doc, "/recipes");
-
-                if (parent.Descendants("recipe").Any(e => (string)e.Attribute("name") == nm))
+                var menu = new GenericMenu();
+                menu.AddItem(new GUIContent("New Recipe"), false, () =>
                 {
-                    EditorUtility.DisplayDialog("Already exists", $"Recipe '{nm}' already exists.", "OK");
-                }
-                else
-                {
-                    var el = new XElement("recipe", new XAttribute("name", nm), new XAttribute("count", "1"));
-                    parent.Add(el);
-                    dirty = true; Rebuild(); selected = recipes.IndexOf(el); selectedPatchEl = null; selectedPatch = -1;
-                }
-            });
-            menu.AddItem(new GUIContent("Append Patch"), false, AddAppendPatch);
-            menu.AddItem(new GUIContent("Set Patch"), false, AddSetPatch);
-            menu.AddItem(new GUIContent("Remove Patch"), false, AddRemovePatch);
-            menu.DropDown(new Rect(Event.current.mousePosition, Vector2.zero));
-        }
+                    if (doc == null && !EnsureDocumentCreated()) return;
+                    if (!EditorPrompt.PromptString("New recipe", "Name:", "newRecipe", out var nm)) return;
 
-        if (GUILayout.Button("Import"))
-        {
-            EditorApplication.delayCall += () => ImportFromBaseRecipes();
-        }
+                    XElement parent = (doc.Root!.Name.LocalName == "recipes") ? doc.Root : EnsureAppendParent(doc, "/recipes");
 
-        GUI.enabled = selected >= 0 && selected < recipes.Count;
-        if (GUILayout.Button("- Delete"))
-        {
-            var el = recipes[selected];
-            string elName = (string?)el.Attribute("name") ?? "(unnamed)";
-            if (EditorUtility.DisplayDialog("Delete", $"Delete '{elName}'?", "Yes", "No"))
-            { el.Remove(); dirty = true; Rebuild(); selected = -1; }
+                    if (parent.Descendants("recipe").Any(e => (string)e.Attribute("name") == nm))
+                    {
+                        EditorUtility.DisplayDialog("Already exists", $"Recipe '{nm}' already exists.", "OK");
+                    }
+                    else
+                    {
+                        var el = new XElement("recipe", new XAttribute("name", nm), new XAttribute("count", "1"));
+                        parent.Add(el);
+                        dirty = true; Rebuild(); selected = recipes.IndexOf(el); selectedPatchEl = null; selectedPatch = -1;
+                    }
+                });
+                menu.AddItem(new GUIContent("Append Patch"), false, AddAppendPatch);
+                menu.AddItem(new GUIContent("Set Patch"), false, AddSetPatch);
+                menu.AddItem(new GUIContent("Remove Patch"), false, AddRemovePatch);
+                menu.DropDown(new Rect(Event.current.mousePosition, Vector2.zero));
+            }
+
+            if (GUILayout.Button("Import"))
+            {
+                EditorApplication.delayCall += () => ImportFromBaseRecipes();
+            }
+
+            GUI.enabled = selected >= 0 && selected < recipes.Count;
+            if (GUILayout.Button("- Delete"))
+            {
+                var el = recipes[selected];
+                string elName = (string?)el.Attribute("name") ?? "(unnamed)";
+                if (EditorUtility.DisplayDialog("Delete", $"Delete '{elName}'?", "Yes", "No"))
+                { el.Remove(); dirty = true; Rebuild(); selected = -1; }
+            }
+            if (GUILayout.Button("▲")) MoveRecipe(-1);
+            if (GUILayout.Button("▼")) MoveRecipe(+1);
+            GUI.enabled = true;
+            EditorGUILayout.EndHorizontal();
         }
-        if (GUILayout.Button("▲")) MoveRecipe(-1);
-        if (GUILayout.Button("▼")) MoveRecipe(+1);
-        GUI.enabled = true;
-        EditorGUILayout.EndHorizontal();
 
         // ---- PATCH LIST ----
         GUILayout.Space(4);
@@ -707,12 +715,21 @@ public class RecipeConfigModule : IConfigModule
     public void Save()
     {
         if (!ctx.HasValidMod) return;
-        if (doc != null) NormalizeDocumentLayout(); // keep structure tidy
+
+        if (ctx.IsVersionLocked)
+        {
+            EditorUtility.DisplayDialog("Locked",
+                $"Cannot save: game version '{ctx.SelectedGameVersion}' is locked. Unlock in the top bar.", "OK");
+            return;
+        }
+
+        if (doc != null) NormalizeDocumentLayout();
         if (doc == null || filePath == null || !dirty) return;
         doc.Save(filePath);
         dirty = false;
         AssetDatabase.Refresh();
     }
+
     void ImportFromBaseRecipes()
     {
         if (ctx == null || string.IsNullOrEmpty(ctx.GameConfigPath))

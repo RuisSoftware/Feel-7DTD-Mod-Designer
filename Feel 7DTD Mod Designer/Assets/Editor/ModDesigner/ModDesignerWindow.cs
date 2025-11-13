@@ -6,6 +6,7 @@ using System.Linq;
 using System.Xml.Linq;
 using UnityEditor;
 using UnityEngine;
+using static UnityEngine.GUILayout;
 
 public class ModDesignerWindow : EditorWindow
 {
@@ -45,6 +46,24 @@ public class ModDesignerWindow : EditorWindow
     private float modulesHeightStart = 220f;
     private float modulesMouseStartY = 0f;
 
+    // --- Versioning state ---
+    ModManifest currentManifest = null;
+    string selectedGameVersion = "";      // huidig gekozen gameversie voor geselecteerde mod
+
+    // persistent per mod (laatste selectie)
+    Dictionary<string, string> lastSelectedGvPerMod = new();
+
+    // voorkomt dat we meerdere Apply-calls in de queue stapelen
+    private bool _applyGvScheduled = false;
+
+    // kleine cache
+    string VersionRootFor(ModEntry m) => Path.Combine(m.ModFolder, "XML");
+    string ConfigPathFor(ModEntry m, string gv)
+        => string.IsNullOrEmpty(gv) ? ResolveConfigFolder(m.ModFolder) : Path.Combine(VersionRootFor(m), gv, "Config");
+
+    // --- Mod version edit buffer (UI) ---
+    string modVersionEditBuffer = "";
+    string modVersionBufferForGv = "";
 
 
     public static GUIContent s_EyeBtn;
@@ -92,8 +111,8 @@ public class ModDesignerWindow : EditorWindow
         if (!Directory.Exists(gameConfigPath))
         {
             // Base config folder not set or not found – fallback to core config modules
-            modules.Add(new EntryXmlModule("Blocks", "blocks.xml", "block"));
-            modules.Add(new EntryXmlModule("Items", "items.xml", "item"));
+            modules.Add(new EntryXmlModule("Blocks", "blocks.xml", "block", "blocks"));
+            modules.Add(new EntryXmlModule("Items", "items.xml", "item", "items"));
             modules.Add(new LocalizationModule());
             return;
         }
@@ -125,8 +144,17 @@ public class ModDesignerWindow : EditorWindow
                 continue;
             }
             string rootTag = baseDoc.Root?.Name.LocalName ?? Path.GetFileNameWithoutExtension(fname);
-            var firstEntry = baseDoc.Descendants().FirstOrDefault(e => e.Attribute("name") != null);
-            string entryTag = firstEntry != null ? firstEntry.Name.LocalName : null;
+            var firstEntry = baseDoc.Root?
+                .Elements()
+                .FirstOrDefault(e =>
+                    e.Attribute("name") != null &&
+                    e.Name.LocalName != "property" &&
+                    e.Name.LocalName != "append" &&
+                    e.Name.LocalName != "set" &&
+                    e.Name.LocalName != "remove");
+
+            string entryTag = firstEntry?.Name.LocalName;
+            if (string.IsNullOrEmpty(entryTag)) continue;
             // Create friendly module name (capitalize and replace underscores)
             string moduleName = rootTag;
             if (moduleName.Contains("_"))
@@ -162,6 +190,18 @@ public class ModDesignerWindow : EditorWindow
         exportModsFolder = EditorPrefs.GetString("MD_exportModsFolder", exportModsFolder);
         modulesListHeight = EditorPrefs.GetFloat("MD_modulesListHeight", 220f);
 
+        // laad laatst gekozen gv per mod uit EditorPrefs (optioneel)
+        var raw = EditorPrefs.GetString("MD_lastGvPerMod", "");
+        if (!string.IsNullOrEmpty(raw))
+        {
+            // formaat: name=gv|name2=gv2|...
+            foreach (var pair in raw.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var kv = pair.Split(new[] { '=' }, 2);
+                if (kv.Length == 2) lastSelectedGvPerMod[kv[0]] = kv[1];
+            }
+        }
+
         BuildModulesList();
         RefreshModList();
         InitializeModulesForCurrentSelection();
@@ -174,67 +214,80 @@ public class ModDesignerWindow : EditorWindow
         EditorPrefs.SetString("MD_gameConfigPath", gameConfigPath);
         EditorPrefs.SetString("MD_rootModsFolder", rootModsFolder);
         EditorPrefs.SetString("MD_exportModsFolder", exportModsFolder);
+
+        // persist lastSelectedGvPerMod
+        var sb = new System.Text.StringBuilder();
+        foreach (var kv in lastSelectedGvPerMod) sb.Append(kv.Key).Append('=').Append(kv.Value).Append('|');
+        EditorPrefs.SetString("MD_lastGvPerMod", sb.ToString());
     }
 
     // ModDesignerWindow.cs - updated OnGUI() function with resizable left pane logic
+    float _cachedHeaderBottom = 0f; // zet dit als veld in de class
+
     void OnGUI()
     {
+        // 1) Header tekenen
         GUILayout.Space(6);
         DrawTopBars();
 
-        // Adds CTRL + S to save
-        if (Event.current.type == EventType.KeyDown)
+        // 2) Marker om betrouwbare yMax te krijgen (werkt in Layout & Repaint)
+        Rect marker = GUILayoutUtility.GetRect(1, 2, GUILayout.ExpandWidth(true));
+        if (Event.current.type == EventType.Repaint) _cachedHeaderBottom = marker.yMax;
+        float headerBottom = Mathf.Max(_cachedHeaderBottom, marker.yMax);
+
+        // (optioneel) visuele scheidslijn
+        EditorGUI.DrawRect(new Rect(0, headerBottom - 1, position.width, 1), new Color(0, 0, 0, 0.2f));
+
+        // 3) Content area onder de header
+        float cw = position.width;
+        float ch = Mathf.Max(1f, position.height - headerBottom);
+        Rect content = new Rect(0, headerBottom, cw, ch);
+
+        // 4) Begin group -> alles hierbinnen is lokaal (0,0) = onder header
+        GUI.BeginGroup(content);
+        try
         {
-            bool cmd = Application.platform == RuntimePlatform.OSXEditor ? Event.current.command : Event.current.control;
-            if (cmd && Event.current.keyCode == KeyCode.S)
+            const float splitterW = 6f, minLeft = 150f, minRight = 320f;
+
+            leftWidth = Mathf.Clamp(leftWidth, minLeft, Mathf.Max(minLeft, content.width - (minRight + splitterW)));
+
+            var leftRect = new Rect(0, 0, leftWidth, content.height);
+            var splitterRect = new Rect(leftRect.xMax, 0, splitterW, content.height);
+            var rightRect = new Rect(splitterRect.xMax, 0, Mathf.Max(1f, content.width - leftWidth - splitterW), content.height);
+
+            // drag binnen de group (muisposities zijn nu group-local)
+            EditorGUIUtility.AddCursorRect(splitterRect, MouseCursor.ResizeHorizontal);
+            if (Event.current.type == EventType.MouseDown && splitterRect.Contains(Event.current.mousePosition))
             {
-                // Shift+S => Save All, anders Save Current
-                if (Event.current.shift)
-                {
-                    foreach (var m in modules) m.Save();
-                }
-                else if (selectedModule >= 0 && selectedModule < modules.Count)
-                {
-                    modules[selectedModule].Save();
-                }
+                draggingLeftSplitter = true;
+                initialMouseX = Event.current.mousePosition.x;
+                initialLeftWidth = leftWidth;
                 Event.current.Use();
             }
-        }
+            if (draggingLeftSplitter && Event.current.type == EventType.MouseDrag)
+            {
+                float dx = Event.current.mousePosition.x - initialMouseX;
+                leftWidth = Mathf.Clamp(initialLeftWidth + dx, minLeft, Mathf.Max(minLeft, content.width - (minRight + splitterW)));
+                Repaint();
+                Event.current.Use();
+            }
+            if (draggingLeftSplitter && Event.current.type == EventType.MouseUp)
+            {
+                draggingLeftSplitter = false;
+                Event.current.Use();
+            }
 
-        // Define main areas for mod list and content
-        var area = new Rect(0, 70, position.width, position.height - 70);
-        // Ensure leftWidth stays within reasonable bounds
-        leftWidth = Mathf.Clamp(leftWidth, 150f, position.width - 400f);
-        var leftRect = new Rect(area.x, area.y, leftWidth, area.height);
-        var splitterRect = new Rect(leftRect.x + leftRect.width, area.y, 6, area.height);
-        var rightRect = new Rect(splitterRect.x + splitterRect.width, area.y, area.width - leftWidth - 6, area.height);
+            // splitter tekenen
+            EditorGUI.DrawRect(new Rect(splitterRect.x + 2f, splitterRect.y, 2f, splitterRect.height), new Color(1f, 0.5f, 0f, 0.6f));
 
-        // Draw draggable vertical splitter
-        EditorGUIUtility.AddCursorRect(splitterRect, MouseCursor.ResizeHorizontal);
-        EditorGUI.DrawRect(new Rect(splitterRect.x + 2, splitterRect.y, 2, splitterRect.height), new Color(1f, 0.5f, 0f, 0.6f));
-        if (Event.current.type == EventType.MouseDown && splitterRect.Contains(Event.current.mousePosition))
-        {
-            draggingLeftSplitter = true;
-            initialMouseX = Event.current.mousePosition.x;
-            initialLeftWidth = leftWidth;
-            Event.current.Use();
+            // panes (tekenen nu gegarandeerd onder de header)
+            DrawLeftPane(leftRect);
+            DrawRightPane(rightRect);
         }
-        if (draggingLeftSplitter && Event.current.type == EventType.MouseDrag)
+        finally
         {
-            float delta = Event.current.mousePosition.x - initialMouseX;
-            leftWidth = Mathf.Clamp(initialLeftWidth + delta, 150f, position.width - 200f);
-            Event.current.Use();
-            Repaint();
+            GUI.EndGroup();
         }
-        if (draggingLeftSplitter && Event.current.type == EventType.MouseUp)
-        {
-            draggingLeftSplitter = false;
-            Event.current.Use();
-        }
-
-        // Draw left mod list and right content
-        DrawLeftPane(leftRect);
-        DrawRightPane(rightRect);
     }
 
 
@@ -289,90 +342,213 @@ public class ModDesignerWindow : EditorWindow
         }
         EditorGUILayout.EndHorizontal();
 
+
+        // Extra tools
+        EditorGUILayout.BeginHorizontal();
+        if (GUILayout.Button("Detect Unity (from game folder)", GUILayout.Width(230)))
+        {
+            string folder = EditorUtility.OpenFolderPanel("Select 7 Days to Die folder", "", "");
+            if (!string.IsNullOrEmpty(folder))
+            {
+                if (UnityVersionUtil.TryGetUnityFromUnityPlayer(folder, out var unityVer))
+                {
+                    var gvi2 = currentManifest?.GetOrCreate(selectedGameVersion);
+                    if (gvi2 != null) { gvi2.unity = unityVer; SaveManifestForSelected(); ApplySelectedGameVersionToContext(); }
+                    EditorUtility.DisplayDialog("Unity detected", $"Detected Unity: {unityVer}\nSaved for GV {selectedGameVersion}.", "OK");
+                }
+                else EditorUtility.DisplayDialog("Not found", "Could not read Unity version from UnityPlayer.dll.", "OK");
+            }
+        }
+        if (GUILayout.Button("Inspect .unity3d…", GUILayout.Width(150)))
+        {
+            string p = EditorUtility.OpenFilePanel("Pick AssetBundle (.unity3d)", "", "unity3d");
+            if (!string.IsNullOrEmpty(p))
+            {
+                if (UnityVersionUtil.TryReadAssetBundleUnityVersions(p, out var engine, out var player))
+                    EditorUtility.DisplayDialog("Bundle header", $"Engine: {engine}\nPlayer: {player}\n\nFile: {p}", "OK");
+                else
+                    EditorUtility.DisplayDialog("Unknown/invalid", "Could not read UnityFS header.", "OK");
+            }
+        }
+        GUILayout.FlexibleSpace();
+        EditorGUILayout.EndHorizontal();
     }
 
-    // ModDesignerWindow.cs - updated DrawLeftPane() function
-    void DrawLeftPane(Rect rect)
+    void DrawGameVersionBar()
     {
-        GUILayout.BeginArea(rect, EditorStyles.helpBox);
-        GUILayout.Label("Mods", EditorStyles.boldLabel);
+        var mod = mods[selectedModIndex];
+        if (currentManifest == null) LoadManifestForSelected();
 
-        // New mod and open folder buttons
+        EditorGUILayout.BeginVertical("box");
         EditorGUILayout.BeginHorizontal();
-        if (GUILayout.Button("New Mod..."))
+
+        // dropdown
+        var versions = currentManifest?.ListGameVersions() ?? Array.Empty<string>();
+        int selIdx = Math.Max(0, Array.IndexOf(versions, selectedGameVersion));
+        EditorGUILayout.LabelField("Game Version:", GUILayout.Width(100));
+        if (versions.Length == 0)
         {
-            EditorApplication.delayCall += CreateNewMod;
+            GUILayout.Label(string.IsNullOrEmpty(selectedGameVersion) ? "(none/legacy)" : selectedGameVersion, EditorStyles.miniBoldLabel);
         }
-        GUI.enabled = selectedModIndex >= 0 && selectedModIndex < mods.Count;
-        if (GUILayout.Button("Open Folder") && selectedModIndex >= 0 && selectedModIndex < mods.Count)
+        else
         {
-            EditorUtility.RevealInFinder(mods[selectedModIndex].ModFolder);
+            int newIdx = EditorGUILayout.Popup(selIdx, versions, GUILayout.Width(140));
+            if (newIdx != selIdx)
+            {
+                selectedGameVersion = versions[newIdx];
+                lastSelectedGvPerMod[mod.Name] = selectedGameVersion;
+                SaveManifestForSelected();
+                ApplySelectedGameVersionToContext();
+            }
         }
-        GUI.enabled = true;
+
+        if (GUILayout.Button("+ New…", GUILayout.Width(80))) NewGameVersionFlow();
+        using (new EditorGUI.DisabledGroupScope(string.IsNullOrEmpty(selectedGameVersion)))
+        {
+            if (GUILayout.Button("Rename", GUILayout.Width(80))) RenameGameVersionFlow();
+            if (GUILayout.Button("Delete", GUILayout.Width(80))) DeleteGameVersionFlow();
+            string lockLabel = (currentManifest?.GetOrCreate(selectedGameVersion)?.locked ?? false) ? "Unlock" : "Lock";
+            if (GUILayout.Button(lockLabel, GUILayout.Width(80))) ToggleLockForSelectedVersion();
+        }
         EditorGUILayout.EndHorizontal();
 
-        // Mods list
-        modsScroll = GUILayout.BeginScrollView(modsScroll, GUILayout.ExpandHeight(true));
-        Color accentColor = new Color(1f, 0.6f, 0.2f);
-        for (int i = 0; i < mods.Count; i++)
+        // per-gv metadata
+        var gvi = string.IsNullOrEmpty(selectedGameVersion) ? null : currentManifest?.GetOrCreate(selectedGameVersion);
+
+        // Zorg dat de buffer matcht met de huidige GV (bij wisselen)
+        if ((modVersionBufferForGv ?? "") != (selectedGameVersion ?? ""))
         {
-            GUI.backgroundColor = (i == selectedModIndex ? accentColor : Color.white);
-            if (GUILayout.Button(mods[i].Name, GUILayout.ExpandWidth(true)))
-            {
-                selectedModIndex = i;
-                InitializeModulesForCurrentSelection();
-                Repaint();
-            }
-            GUI.backgroundColor = Color.white;
+            modVersionEditBuffer = gvi?.modVersion ?? "1.0";
+            modVersionBufferForGv = selectedGameVersion ?? "";
         }
-        GUILayout.EndScrollView();
-        GUILayout.EndArea();
+
+        using (new EditorGUI.DisabledGroupScope(gvi?.locked ?? false))
+        {
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField(new GUIContent("Mod Version:"), GUILayout.Width(100));
+            // huidige versie als tekst
+            GUILayout.Label(string.IsNullOrEmpty(gvi?.modVersion) ? "1.0" : gvi.modVersion, EditorStyles.miniBoldLabel, GUILayout.Width(80));
+            // invoerveld (buffer)
+            modVersionEditBuffer = EditorGUILayout.TextField(modVersionEditBuffer, GUILayout.Width(100));
+            // toepassen via knop
+            if (GUILayout.Button("Change", GUILayout.Width(70)))
+            {
+                SetModVersionForSelected(string.IsNullOrWhiteSpace(modVersionEditBuffer) ? "1.0" : modVersionEditBuffer.Trim());
+                SaveManifestForSelected();
+                ApplySelectedGameVersionToContext(); // refresh UI + context
+                                                     // buffer updaten zodat label en field in sync blijven
+                var gvi2 = currentManifest?.GetOrCreate(selectedGameVersion);
+                modVersionEditBuffer = gvi2?.modVersion ?? "1.0";
+                modVersionBufferForGv = selectedGameVersion ?? "";
+            }
+            EditorGUILayout.EndHorizontal();
+        }
+
+
+        // info & lock notice
+        if (gvi?.locked == true)
+            EditorGUILayout.HelpBox($"Game version '{selectedGameVersion}' is LOCKED. Unlock to edit.", MessageType.Warning);
+
+        // context path duidelijk maken
+        EditorGUILayout.LabelField("Active Config Path:", mods[selectedModIndex].ConfigFolder, EditorStyles.miniLabel);
+
+        EditorGUILayout.EndVertical();
+
+    }
+    void DrawLeftPane(Rect rect)
+    {
+        if (rect.width < 1f) rect.width = 1f;
+        if (rect.height < 1f) rect.height = 1f;
+
+        using (new AreaScope(rect))
+        using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+        {
+            GUILayout.Label("Mods", EditorStyles.boldLabel);
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button("New Mod..."))
+                    EditorApplication.delayCall += CreateNewMod;
+
+                using (new EditorGUI.DisabledGroupScope(!(selectedModIndex >= 0 && selectedModIndex < mods.Count)))
+                {
+                    if (GUILayout.Button("Open Folder") && selectedModIndex >= 0 && selectedModIndex < mods.Count)
+                        EditorUtility.RevealInFinder(mods[selectedModIndex].ModFolder);
+                }
+            }
+
+            using (var sv = new EditorGUILayout.ScrollViewScope(modsScroll, GUILayout.ExpandHeight(true)))
+            {
+                modsScroll = sv.scrollPosition;
+                Color accentColor = new Color(1f, 0.6f, 0.2f);
+                for (int i = 0; i < mods.Count; i++)
+                {
+                    var old = GUI.backgroundColor;
+                    GUI.backgroundColor = (i == selectedModIndex ? accentColor : Color.white);
+                    if (GUILayout.Button(mods[i].Name, GUILayout.ExpandWidth(true)))
+                    {
+                        selectedModIndex = i;
+                        InitializeModulesForCurrentSelection();
+                        Repaint();
+                    }
+                    GUI.backgroundColor = old;
+                }
+            }
+        }
     }
 
 
-    // ModDesignerWindow.cs - updated DrawRightPane() function
     void DrawRightPane(Rect rect)
     {
-        bool useArea = rect.width > 1f && rect.height > 1f;
-        bool areaStarted = false;
-        try
-        {
-            if (useArea)
-            {
-                GUILayout.BeginArea(rect);
-                areaStarted = true;
-            }
+        if (rect.width < 1f) rect.width = 1f;
+        if (rect.height < 1f) rect.height = 1f;
 
+        using (new AreaScope(rect))
+        {
+            // Geen mod geselecteerd
             if (selectedModIndex < 0 || selectedModIndex >= mods.Count)
             {
                 EditorGUILayout.HelpBox("Select a mod on the left or create a new one.", MessageType.Info);
-                return;
+                return; // AreaScope sluit netjes
             }
 
             var mod = mods[selectedModIndex];
-            // Header
             GUILayout.Label(mod.Name, EditorStyles.boldLabel);
-            EditorGUILayout.LabelField("Config:", mod.ConfigFolder, EditorStyles.miniLabel);
-            GUILayout.Space(6);
 
-            // Module selection list (resizable)
-            GUILayout.Label("Modules", EditorStyles.boldLabel);
-            var moduleNames = modules.Select(m => m.ModuleName).ToArray();
-            modulesListHeight = Mathf.Clamp(modulesListHeight, 80f, Mathf.Max(120f, rect.height - 300f)); // sane bounds per layout
-            moduleScroll = GUILayout.BeginScrollView(moduleScroll, GUILayout.Height(modulesListHeight));
+            // Game Version balk
+            DrawGameVersionBar();
 
-            for (int i = 0; i < modules.Count; i++)
+            // >>> Kritieke guard: render niets van Modules zolang er geen GV is <<<
+            var hasAnyGv = (currentManifest?.ListGameVersions()?.Length ?? 0) > 0;
+            if (!hasAnyGv)
             {
-                string name = modules[i].ModuleName;
-                bool hasFile = moduleAvailability.TryGetValue(name, out var exists) && exists;
-                var oldColor = GUI.color;
-                GUI.color = hasFile ? Color.green : Color.red;
-                GUIStyle style = (i == selectedModule) ? "Button" : "miniButton";
-                if (GUILayout.Button(name, style)) selectedModule = i;
-                GUI.color = oldColor;
+                GUILayout.Space(6);
+                EditorGUILayout.HelpBox("No game versions yet. Create one to enable the modules UI.", MessageType.Info);
+                return; // voorkomt layout-issues in modules wanneer GV leeg is
             }
-            GUILayout.EndScrollView();
-            // Draggable splitter for "Modules" height
+
+            GUILayout.Space(6);
+            GUILayout.Label("Modules", EditorStyles.boldLabel);
+
+            // Modulelijst (scroll + splitter)
+            modulesListHeight = Mathf.Clamp(modulesListHeight, 80f, Mathf.Max(120f, rect.height - 300f));
+            using (var sv = new EditorGUILayout.ScrollViewScope(moduleScroll, GUILayout.Height(modulesListHeight)))
+            {
+                moduleScroll = sv.scrollPosition;
+
+                for (int i = 0; i < modules.Count; i++)
+                {
+                    string name = modules[i].ModuleName;
+                    bool hasFile = moduleAvailability.TryGetValue(name, out var exists) && exists;
+                    var oldColor = GUI.color;
+                    GUI.color = hasFile ? Color.green : Color.red;
+                    var style = (i == selectedModule) ? "Button" : "miniButton";
+                    if (GUILayout.Button(name, style)) selectedModule = i;
+                    GUI.color = oldColor;
+                }
+            }
+
+            // Splitter hoogte
             Rect modulesSplitterRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.Height(4), GUILayout.ExpandWidth(true));
             EditorGUI.DrawRect(new Rect(modulesSplitterRect.x, modulesSplitterRect.y + modulesSplitterRect.height / 2f - 1f, modulesSplitterRect.width, 2f),
                                new Color(1f, 0.5f, 0f, 0.6f));
@@ -389,32 +565,31 @@ public class ModDesignerWindow : EditorWindow
             {
                 float curY = GUIUtility.GUIToScreenPoint(Event.current.mousePosition).y;
                 float delta = curY - modulesMouseStartY;
-
-                // Max hoogte afhankelijk van beschikbare ruimte in het rechterpaneel
                 float maxH = Mathf.Max(120f, rect.height - 300f);
                 modulesListHeight = Mathf.Clamp(modulesHeightStart + delta, 80f, maxH);
-
                 Repaint();
                 Event.current.Use();
             }
             if (draggingModulesHeight && Event.current.type == EventType.MouseUp)
             {
                 draggingModulesHeight = false;
-                // Optioneel meteen persistenter maken
                 EditorPrefs.SetFloat("MD_modulesListHeight", modulesListHeight);
                 Event.current.Use();
             }
 
             GUILayout.Space(6);
 
-            GUILayout.Space(6);
+            // Als er geen geldig selectedModule is, clampen
+            if (modules.Count == 0) return;
+            if (selectedModule < 0 || selectedModule >= modules.Count) selectedModule = 0;
 
-            // Prompt to create missing config file for selected module
+            // Als geselecteerd module-bestand ontbreekt, toon create prompt
             if (selectedModule >= 0 && selectedModule < modules.Count)
             {
-                string cfgFolder = mods[selectedModIndex].ConfigFolder;
+                string cfgFolder = mods[selectedModIndex].ConfigFolder ?? "";
                 string targetFile = null;
                 string suggestedRoot = null;
+
                 if (modules[selectedModule] is EntryXmlModule em)
                 {
                     targetFile = Path.Combine(cfgFolder, em.FileName);
@@ -425,75 +600,172 @@ public class ModDesignerWindow : EditorWindow
                     targetFile = Path.Combine(cfgFolder, rc.FileName);
                     suggestedRoot = Path.GetFileNameWithoutExtension(rc.FileName);
                 }
+
                 if (!string.IsNullOrEmpty(targetFile) && !File.Exists(targetFile))
                 {
                     EditorGUILayout.HelpBox($"{Path.GetFileName(targetFile)} does not exist in this mod yet.", MessageType.Info);
-                    EditorGUILayout.BeginHorizontal();
-                    if (GUILayout.Button($"Create {Path.GetFileName(targetFile)}"))
+                    using (new EditorGUILayout.HorizontalScope())
                     {
-                        Directory.CreateDirectory(cfgFolder);
-                        File.WriteAllText(
-                            targetFile,
-                            $"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<{suggestedRoot}>\n</{suggestedRoot}>\n"
-                        );
-                        AssetDatabase.Refresh();
-                        EditorApplication.delayCall += () =>
+                        if (GUILayout.Button($"Create {Path.GetFileName(targetFile)}"))
                         {
-                            InitializeModulesForCurrentSelection();
-                            Repaint();
-                        };
+                            Directory.CreateDirectory(cfgFolder);
+                            File.WriteAllText(
+                                targetFile,
+                                $"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<{suggestedRoot}>\n</{suggestedRoot}>\n"
+                            );
+                            AssetDatabase.Refresh();
+                            EditorApplication.delayCall += () =>
+                            {
+                                InitializeModulesForCurrentSelection();
+                                Repaint();
+                            };
+                        }
+                        if (GUILayout.Button("Open Config Folder", GUILayout.Width(150)))
+                            EditorUtility.RevealInFinder(cfgFolder);
                     }
-                    if (GUILayout.Button("Open Config Folder", GUILayout.Width(150)))
-                    {
-                        EditorUtility.RevealInFinder(cfgFolder);
-                    }
-                    EditorGUILayout.EndHorizontal();
                     GUILayout.Space(6);
                 }
             }
 
-            // Module content (list and inspector panels)
-            EditorGUILayout.BeginVertical(GUILayout.ExpandHeight(true));
-            EditorGUILayout.BeginHorizontal(GUILayout.ExpandHeight(true));
-
-            // Left panel: module entry list
-            EditorGUILayout.BeginVertical(EditorStyles.helpBox, GUILayout.Width(340), GUILayout.ExpandHeight(true));
-            try { modules[selectedModule].OnGUIList(new Rect()); } catch { }
-            EditorGUILayout.EndVertical();
-
-            GUILayout.Space(6);
-
-            // Right panel: module inspector
-            EditorGUILayout.BeginVertical(EditorStyles.helpBox, GUILayout.ExpandWidth(true), GUILayout.ExpandHeight(true));
-            try { modules[selectedModule].OnGUIInspector(new Rect()); } catch { }
-            EditorGUILayout.EndVertical();
-
-            EditorGUILayout.EndHorizontal();
-            GUILayout.FlexibleSpace();
-
-            // Bottom buttons for saving and exporting
-            EditorGUILayout.BeginHorizontal();
-            if (GUILayout.Button("Save Current")) modules[selectedModule].Save();
-            if (GUILayout.Button("Save All"))
+            // Content: lijst & inspector naast elkaar
+            using (new EditorGUILayout.VerticalScope(GUILayout.ExpandHeight(true)))
             {
-                foreach (var m in modules) m.Save();
-                if (EditorUtility.DisplayDialog("AssetBundle", "Rebuild asset bundle for this mod?", "Yes", "No"))
+                using (new EditorGUILayout.HorizontalScope(GUILayout.ExpandHeight(true)))
                 {
-                    BuildAssetsForSelectedMod();
+                    using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox, GUILayout.Width(340), GUILayout.ExpandHeight(true)))
+                    {
+                        // Let op: als een module intern Begin/End uit balans heeft, crasht Unity alsnog.
+                        // Deze call werkte voorheen, en met de GV-guard hierboven vermijden we de probleemtoestand.
+                        try { modules[selectedModule].OnGUIList(new Rect()); } catch { }
+                    }
+
+                    GUILayout.Space(6);
+
+                    using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox, GUILayout.ExpandWidth(true), GUILayout.ExpandHeight(true)))
+                    {
+                        try { modules[selectedModule].OnGUIInspector(new Rect()); } catch { }
+                    }
+                }
+
+                GUILayout.FlexibleSpace();
+
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    if (GUILayout.Button("Save Current"))
+                    {
+                        modules[selectedModule].Save();
+                        SaveManifestForSelected();
+                    }
+                    if (GUILayout.Button("Save All"))
+                    {
+                        foreach (var m in modules) m.Save();
+                        SaveManifestForSelected();
+                        if (EditorUtility.DisplayDialog("AssetBundle", "Rebuild asset bundle for this mod?", "Yes", "No"))
+                            BuildAssetsForSelectedMod();
+                    }
+                }
+
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    if (GUILayout.Button("Export this mod")) ExportMod(mod);
+                    if (GUILayout.Button("Export all mods")) ExportAllMods();
                 }
             }
-            EditorGUILayout.EndHorizontal();
-
-            EditorGUILayout.BeginHorizontal();
-            if (GUILayout.Button("Export this mod")) ExportMod(mod);
-            if (GUILayout.Button("Export all mods")) ExportAllMods();
-            EditorGUILayout.EndHorizontal();
-
-            EditorGUILayout.EndVertical();
         }
-        finally
+    }
+
+    static string NormalizePath(string p)
+    {
+        if (string.IsNullOrEmpty(p)) return "";
+        return Path.GetFullPath(p)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .ToLowerInvariant();
+    }
+
+    static bool IsSubPathOf(string child, string parent)
+    {
+        var c = NormalizePath(child);
+        var p = NormalizePath(parent);
+        if (string.IsNullOrEmpty(c) || string.IsNullOrEmpty(p)) return false;
+        return c == p || c.StartsWith(p + Path.DirectorySeparatorChar);
+    }
+
+    static bool DirHasContent(string dir)
+    {
+        try { return Directory.Exists(dir) && Directory.EnumerateFileSystemEntries(dir).Any(); }
+        catch { return false; }
+    }
+
+    void ClearDirectory(string dir)
+    {
+        if (!Directory.Exists(dir)) return;
+        foreach (var f in Directory.GetFiles(dir)) File.Delete(f);
+        foreach (var d in Directory.GetDirectories(dir)) Directory.Delete(d, true);
+    }
+
+    void SafeDeleteSourceTreeIfAllowed(string src, ModEntry mod, string newModFolderToShow = null)
+    {
+        try
         {
-            if (areaStarted) GUILayout.EndArea();
+            if (IsSubPathOf(src, gameConfigPath))
+            {
+                EditorUtility.DisplayDialog("Refused",
+                    "For safety, I won't delete files from the base game's Data/Config.", "OK");
+                return;
+            }
+            if (!IsSubPathOf(src, mod.ModFolder))
+            {
+                EditorUtility.DisplayDialog("Refused",
+                    "Source folder is outside this mod. Not deleting.", "OK");
+                return;
+            }
+
+            var versionRoot = VersionRootFor(mod);
+            if (string.Equals(NormalizePath(src), NormalizePath(versionRoot), StringComparison.OrdinalIgnoreCase))
+            {
+                EditorUtility.DisplayDialog("Refused", "I will not delete the XML root folder.", "OK");
+                return;
+            }
+            if (string.Equals(NormalizePath(src), NormalizePath(Path.Combine(versionRoot, "Config")), StringComparison.OrdinalIgnoreCase))
+            {
+                EditorUtility.DisplayDialog("Refused", "I will not delete the legacy XML/Config folder.", "OK");
+                return;
+            }
+
+            // 3-knops dialoog met 'Toon nieuwe mod map'
+            while (true)
+            {
+                int res = EditorUtility.DisplayDialogComplex(
+                    "Delete old files?",
+                    $"Delete the old source folder?\n\n{src}",
+                    "Delete",                               // 0
+                    "Show new mod folder",                  // 1
+                    "Cancel"                                // 2
+                );
+
+                if (res == 2) return; // Cancel
+                if (res == 1)
+                {
+                    if (!string.IsNullOrEmpty(newModFolderToShow))
+                        EditorUtility.RevealInFinder(newModFolderToShow);
+                    // loop terug naar confirm
+                    continue;
+                }
+
+                // res == 0 → Delete
+                Directory.Delete(src, true);
+
+                var parent = Path.GetDirectoryName(src);
+                if (!string.IsNullOrEmpty(parent) && Directory.Exists(parent) && !Directory.EnumerateFileSystemEntries(parent).Any())
+                    Directory.Delete(parent, true);
+
+                AssetDatabase.Refresh();
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError("[ModDesigner] Failed to delete source: " + ex);
         }
     }
 
@@ -506,65 +778,195 @@ public class ModDesignerWindow : EditorWindow
             EditorUtility.DisplayDialog("Export folder", "No export folder set.", "OK");
             return;
         }
-        foreach (var m in modules) m.Save();  // save all modules (including Localization)
-        BuildAssetBundleForMod(mod);
-        string destModPath = Path.Combine(exportModsFolder, mod.Name);
-        if (Directory.Exists(destModPath))
+
+        // Kies doel gameversie (zoals je had)
+        var manifest = ModManifest.Load(mod.ModFolder);
+        var gvList = manifest.ListGameVersions();
+        string defaultGv = string.IsNullOrEmpty(selectedGameVersion) ? manifest.currentGameVersion : selectedGameVersion;
+
+        string chosenGv = defaultGv;
+        if (gvList.Length > 0)
         {
-            Directory.Delete(destModPath, true);
+            int pick = EntryXmlModule.SimpleListPicker.Show("Export – choose Game Version", "Pick the game version to export", gvList);
+            if (pick < 0) return;
+            chosenGv = gvList[pick];
         }
+        var gvi = string.IsNullOrEmpty(chosenGv) ? null : manifest.GetOrCreate(chosenGv);
+
+        // (Unity mismatch waarschuwing: ongewijzigd)
+        if (!string.IsNullOrEmpty(gvi?.unity) && !Application.unityVersion.StartsWith(gvi.unity))
+        {
+            int res = EditorUtility.DisplayDialogComplex(
+                "Unity mismatch",
+                $"Target GV '{chosenGv}' expects Unity '{gvi.unity}', current editor is '{Application.unityVersion}'.\n\nProceed anyway?",
+                "Force export", "Cancel", "Proceed (no bundle)"
+            );
+            if (res == 1) return;
+            if (res == 2) gvi.unity = "";
+        }
+
+        // Save all modules (ongewijzigd)
+        foreach (var m in modules) m.Save();
+
+        // Optioneel bundle (ongewijzigd)
+        bool buildBundle = EditorUtility.DisplayDialog("AssetBundle", "Build asset bundle for this mod?", "Yes", "No");
+        if (buildBundle && (gvi == null || string.IsNullOrEmpty(gvi.unity) || Application.unityVersion.StartsWith(gvi.unity)))
+        {
+            BuildAssetBundleForMod(mod);
+        }
+
+        // --- NIEUW: versie-gesegmenteerde exportmap ---
+        string fullVersion = ComposeFullVersionString(chosenGv, gvi?.modVersion ?? "1.0");
+        string destRoot = Path.Combine(exportModsFolder, mod.Name + "_" + fullVersion);      // "ExportLocation/<Version>"
+        string destModPath = destRoot;              // binnen de versie-map komt de mod-map
+        if (Directory.Exists(destModPath)) Directory.Delete(destModPath, true);
         Directory.CreateDirectory(destModPath);
-        string modInfoSrc = File.Exists(Path.Combine(mod.ModFolder, "ModInfo.xml"))
-                            ? Path.Combine(mod.ModFolder, "ModInfo.xml")
-                            : Path.Combine(mod.ModFolder, "XML", "ModInfo.xml");
-        if (File.Exists(modInfoSrc))
+        Directory.CreateDirectory(destRoot);
+
+        // --- ModInfo.xml schrijven (GV-specifiek prefereren) ---
+        string srcModInfo =
+            // 1) versie-specifiek
+            (!string.IsNullOrEmpty(chosenGv) ? Path.Combine(mod.ModFolder, "XML", chosenGv, "ModInfo.xml") : null);
+        if (string.IsNullOrEmpty(srcModInfo) || !File.Exists(srcModInfo))
         {
-            File.Copy(modInfoSrc, Path.Combine(destModPath, "ModInfo.xml"), overwrite: true);
+            // 2) XML/ModInfo.xml
+            string fallback1 = Path.Combine(mod.ModFolder, "XML", "ModInfo.xml");
+            // 3) root/ModInfo.xml
+            string fallback2 = Path.Combine(mod.ModFolder, "ModInfo.xml");
+            srcModInfo = File.Exists(fallback1) ? fallback1 : (File.Exists(fallback2) ? fallback2 : null);
         }
-        string xmlPath = Path.Combine(mod.ModFolder, "XML");
-        if (Directory.Exists(xmlPath))
+
+        string outModInfo = Path.Combine(destModPath, "ModInfo.xml");
+        Directory.CreateDirectory(Path.GetDirectoryName(outModInfo)!);
+
+        if (!string.IsNullOrEmpty(srcModInfo) && File.Exists(srcModInfo))
         {
-            foreach (string dir in Directory.GetDirectories(xmlPath))
+            try
             {
-                string dirName = Path.GetFileName(dir);
-                if (dirName.Equals("Config", StringComparison.OrdinalIgnoreCase) ||
-                    dirName.Equals("Resources", StringComparison.OrdinalIgnoreCase) ||
-                    dirName.Equals("UIAtlases", StringComparison.OrdinalIgnoreCase) ||
-                    dirName.Equals("ItemIcons", StringComparison.OrdinalIgnoreCase))
+                var xdoc = System.Xml.Linq.XDocument.Load(srcModInfo);
+                // Sommige bestanden hebben <xml><ModInfo>... of alleen <xml> met velden.
+                var container = xdoc.Root?.Element("ModInfo") ?? xdoc.Root;
+                if (container != null)
                 {
-                    string destDir = Path.Combine(destModPath, dirName);
-                    CopyDirectory(dir, destDir);
+                    var verEl = container.Element("Version");
+                    if (verEl == null)
+                    {
+                        verEl = new System.Xml.Linq.XElement("Version", new System.Xml.Linq.XAttribute("value", fullVersion));
+                        container.Add(verEl);
+                    }
+                    else
+                    {
+                        if (verEl.Attribute("value") != null) verEl.SetAttributeValue("value", fullVersion);
+                        else verEl.Value = fullVersion;
+                    }
                 }
+                xdoc.Save(outModInfo);
             }
-            foreach (string file in Directory.GetFiles(xmlPath))
+            catch
             {
-                string fileName = Path.GetFileName(file);
-                if (fileName.Equals("ModInfo.xml", StringComparison.OrdinalIgnoreCase)) continue;
-                if (fileName.Equals("Localization.txt", StringComparison.OrdinalIgnoreCase))
-                {
-                    string dest = Path.Combine(destModPath, "Config", "Localization.txt");
-                    Directory.CreateDirectory(Path.GetDirectoryName(dest));
-                    File.Copy(file, dest, true);
-                }
-                else if (fileName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
-                {
-                    string dest = Path.Combine(destModPath, "Config", fileName);
-                    Directory.CreateDirectory(Path.Combine(destModPath, "Config"));
-                    File.Copy(file, dest, true);
-                }
+                File.Copy(srcModInfo, outModInfo, true);
             }
         }
-        else if (Directory.Exists(Path.Combine(mod.ModFolder, "Config")))
+        else
         {
-            CopyDirectory(Path.Combine(mod.ModFolder, "Config"), Path.Combine(destModPath, "Config"));
-            if (Directory.Exists(Path.Combine(mod.ModFolder, "Resources")))
-                CopyDirectory(Path.Combine(mod.ModFolder, "Resources"), Path.Combine(destModPath, "Resources"));
-            if (Directory.Exists(Path.Combine(mod.ModFolder, "UIAtlases")))
-                CopyDirectory(Path.Combine(mod.ModFolder, "UIAtlases"), Path.Combine(destModPath, "UIAtlases"));
-            if (File.Exists(Path.Combine(mod.ModFolder, "ModInfo.xml")))
-                File.Copy(Path.Combine(mod.ModFolder, "ModInfo.xml"), Path.Combine(destModPath, "ModInfo.xml"), true);
+            // Minimale ModInfo genereren als niks bestaat
+            File.WriteAllText(outModInfo,
+    $@"<?xml version=""1.0"" encoding=""UTF-8""?>
+<xml><ModInfo>
+  <Name value=""{mod.Name}""/>
+  <DisplayName value=""{mod.Name}""/>
+  <Description value=""Created with Mod Designer"" />
+  <Author value=""You""/>
+  <Version value=""{fullVersion}""/>
+  <Website value="""" />
+</ModInfo></xml>");
         }
-        EditorUtility.DisplayDialog("Mod exported", $"Mod '{mod.Name}' was copied to: {destModPath}", "OK");
+
+        // --- Config kopiëren voor gekozen GV (ongewijzigde basis, maar naar nieuwe dest) ---
+        string srcConfig = string.IsNullOrEmpty(chosenGv)
+            ? ResolveConfigFolder(mod.ModFolder)
+            : Path.Combine(mod.ModFolder, "XML", chosenGv, "Config");
+        if (!Directory.Exists(srcConfig))
+        {
+            EditorUtility.DisplayDialog("Missing Config", $"Config folder not found for GV '{chosenGv}'.\n{srcConfig}", "OK");
+            return;
+        }
+        string destConfig = Path.Combine(destModPath, "Config");
+        CopyDirectory(srcConfig, destConfig);
+
+        // --- Resources & UIAtlases etc. (ongewijzigd) ---
+        string xmlRoot = Path.Combine(mod.ModFolder, "XML");
+        foreach (string dir in new[] { "Resources", "UIAtlases", "ItemIcons" })
+        {
+            string src = Path.Combine(xmlRoot, dir);
+            if (Directory.Exists(src))
+                CopyDirectory(src, Path.Combine(destModPath, dir));
+        }
+        // losse bestanden in XML root meenemen (Localization.txt, etc.)
+        foreach (string file in Directory.GetFiles(xmlRoot))
+        {
+            var name = Path.GetFileName(file);
+            if (name.Equals("ModInfo.xml", StringComparison.OrdinalIgnoreCase)) continue;
+            if (name.Equals("manifest.json", StringComparison.OrdinalIgnoreCase)) continue;
+            if (name.Equals("Localization.txt", StringComparison.OrdinalIgnoreCase))
+            {
+                Directory.CreateDirectory(Path.Combine(destModPath, "Config"));
+                File.Copy(file, Path.Combine(destModPath, "Config", "Localization.txt"), true);
+            }
+        }
+
+        // --- NIEUW: README meenemen indien aanwezig ---
+        CopyReadmeIfExists(mod.ModFolder, chosenGv, destModPath);
+        CopyModSettingsIfExists(mod.ModFolder, chosenGv, destModPath);
+
+        EditorUtility.DisplayDialog("Mod exported",
+            $"Mod '{mod.Name}' exported to:\n{destModPath}\n\n" +
+            $"Game Version: {chosenGv}\nVersion in ModInfo: {fullVersion}",
+            "OK");
+    }
+
+    void CopyReadmeIfExists(string modRoot, string chosenGv, string destModPath)
+    {
+        // Zoeken in volgorde: versie-specifiek → XML root → mod root
+        var candidates = new List<string>();
+
+        if (!string.IsNullOrEmpty(chosenGv))
+        {
+            candidates.Add(Path.Combine(modRoot, "XML", chosenGv, "readme.md"));
+            candidates.Add(Path.Combine(modRoot, "XML", chosenGv, "readme.txt"));
+        }
+        candidates.Add(Path.Combine(modRoot, "XML", "readme.md"));
+        candidates.Add(Path.Combine(modRoot, "XML", "readme.txt"));
+        candidates.Add(Path.Combine(modRoot, "readme.md"));
+        candidates.Add(Path.Combine(modRoot, "readme.txt"));
+
+        string found = candidates.FirstOrDefault(File.Exists);
+        if (!string.IsNullOrEmpty(found))
+        {
+            string dest = Path.Combine(destModPath, Path.GetFileName(found));
+            try { File.Copy(found, dest, true); } catch { /* ignore */ }
+        }
+    }
+
+    void CopyModSettingsIfExists(string modRoot, string chosenGv, string destModPath)
+    {
+        // Zoeken in volgorde: versie-specifiek → XML root → mod root
+        var candidates = new List<string>();
+
+        if (!string.IsNullOrEmpty(chosenGv))
+        {
+            candidates.Add(Path.Combine(modRoot, "XML", chosenGv, "ModSettings.xml"));
+            candidates.Add(Path.Combine(modRoot, "XML", chosenGv, "modsettings.txt"));
+        }
+        candidates.Add(Path.Combine(modRoot, "XML", "ModSettings.txt"));
+        candidates.Add(Path.Combine(modRoot, "modsettings.txt"));
+
+        string found = candidates.FirstOrDefault(File.Exists);
+        if (!string.IsNullOrEmpty(found))
+        {
+            string dest = Path.Combine(destModPath, Path.GetFileName(found));
+            try { File.Copy(found, dest, true); } catch { /* ignore */ }
+        }
     }
 
 
@@ -766,12 +1168,37 @@ public class ModDesignerWindow : EditorWindow
         var ctx = new ModContext { GameConfigPath = gameConfigPath };
         if (selectedModIndex >= 0 && selectedModIndex < mods.Count)
         {
-            ctx.ModFolder = mods[selectedModIndex].ModFolder;
-            ctx.ModConfigPath = mods[selectedModIndex].ConfigFolder;
-            ctx.ModName = mods[selectedModIndex].Name;
-        }
-        moduleAvailability.Clear();
+            var mod = mods[selectedModIndex];
 
+            currentManifest = ModManifest.Load(mod.ModFolder);
+
+            // <<< voeg toe
+            PruneManifestVersionsForSelectedMod(save: true);
+
+            // daarna pas selectedGameVersion bepalen
+            string cachedGv;
+            if (lastSelectedGvPerMod.TryGetValue(mod.Name, out cachedGv))
+                selectedGameVersion = cachedGv;
+            else
+                selectedGameVersion = string.IsNullOrEmpty(currentManifest.currentGameVersion) ? "" : currentManifest.currentGameVersion;
+
+            // Stel de ConfigFolder van de ModEntry in
+            mod.ConfigFolder = ConfigPathFor(mod, selectedGameVersion) ?? ResolveConfigFolder(mod.ModFolder);
+
+            // (2) Context
+            ctx.ModFolder = mod.ModFolder;
+            ctx.ModConfigPath = mod.ConfigFolder;
+            ctx.ModName = mod.Name;
+
+            var gvi = string.IsNullOrEmpty(selectedGameVersion) ? null : currentManifest.GetOrCreate(selectedGameVersion);
+            ctx.SelectedGameVersion = selectedGameVersion ?? "";
+            ctx.IsVersionLocked = gvi?.locked ?? false;
+            ctx.UnityTarget = gvi?.unity ?? "";
+            ctx.ModVersion = gvi?.modVersion ?? "1.0";
+            ctx.ManifestPath = ModManifest.GetManifestPath(mod.ModFolder);
+        }
+
+        moduleAvailability.Clear();
         foreach (var m in modules)
         {
             m.Initialize(ctx);
@@ -788,11 +1215,12 @@ public class ModDesignerWindow : EditorWindow
             }
             else
             {
-                moduleAvailability[m.ModuleName] = true; // ModInfo etc altijd aanwezig
+                moduleAvailability[m.ModuleName] = true;
             }
         }
         Repaint();
     }
+
 
     // ModDesignerWindow.cs - updated CreateNewMod() function
     void CreateNewMod()
@@ -832,13 +1260,633 @@ public class ModDesignerWindow : EditorWindow
         };
     }
 
-
-    void Ensure(string folder, string file, string root)
+    void LoadManifestForSelected()
     {
-        var path = Path.Combine(folder, file);
-        if (!File.Exists(path))
+        currentManifest = null;
+        selectedGameVersion = "";
+        if (selectedModIndex < 0 || selectedModIndex >= mods.Count) return;
+
+        var mod = mods[selectedModIndex];
+        currentManifest = ModManifest.Load(mod.ModFolder);
+
+        // >>> NIEUW: opruimen van niet-bestaande versie-mappen
+        PruneManifestVersionsForSelectedMod(save: true);
+
+        // kies gv: manifest → cache (alleen als nog bestaat) → leeg
+        if (!string.IsNullOrEmpty(currentManifest.currentGameVersion))
         {
-            File.WriteAllText(path, $"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n{root}\n");
+            selectedGameVersion = currentManifest.currentGameVersion;
+        }
+        else if (lastSelectedGvPerMod.TryGetValue(mod.Name, out var gv) && currentManifest.versions.ContainsKey(gv))
+        {
+            selectedGameVersion = gv;
+        }
+        else
+        {
+            selectedGameVersion = "";
+        }
+
+        EnsureSelectedGvIsValid(scheduleApply: false);
+        ApplySelectedGameVersionToContext();
+    }
+
+
+    void SaveManifestForSelected()
+    {
+        if (selectedModIndex < 0 || selectedModIndex >= mods.Count) return;
+        if (currentManifest == null) return;
+
+        currentManifest.currentGameVersion = selectedGameVersion ?? "";
+        currentManifest.Save(mods[selectedModIndex].ModFolder);
+    }
+
+    void ApplySelectedGameVersionToContext()
+    {
+        if (selectedModIndex < 0 || selectedModIndex >= mods.Count) { _applyGvScheduled = false; return; }
+
+        var mod = mods[selectedModIndex];
+
+        // Config-pad naar de GV mappen
+        var gvPath = ConfigPathFor(mod, selectedGameVersion);
+        if (!string.IsNullOrEmpty(gvPath))
+            mod.ConfigFolder = gvPath;
+
+        // Context opbouwen
+        var ctx = new ModContext
+        {
+            GameConfigPath = gameConfigPath,
+            ModFolder = mod.ModFolder,
+            ModConfigPath = mod.ConfigFolder,
+            ModName = mod.Name,
+            ManifestPath = ModManifest.GetManifestPath(mod.ModFolder),
+            SelectedGameVersion = selectedGameVersion ?? ""
+        };
+
+        var gvi = string.IsNullOrEmpty(selectedGameVersion) ? null : currentManifest?.GetOrCreate(selectedGameVersion);
+        ctx.IsVersionLocked = gvi?.locked ?? false;
+        ctx.UnityTarget = gvi?.unity ?? "";
+        ctx.ModVersion = gvi?.modVersion ?? "1.0";
+
+        // Modules re-initialiseren met nieuwe context (zonder her-enter van je vensterlogica)
+        foreach (var m in modules) m.Initialize(ctx);
+
+        // Availability opnieuw berekenen (zodat je Modules-lijst kleuren/knoppen klopt)
+        moduleAvailability.Clear();
+        foreach (var m in modules)
+        {
+            if (m is EntryXmlModule entry)
+            {
+                var path = Path.Combine(ctx.ModConfigPath ?? "", entry.FileName);
+                moduleAvailability[entry.ModuleName] = File.Exists(path);
+            }
+            else if (m is RecipeConfigModule recipe)
+            {
+                var path = Path.Combine(ctx.ModConfigPath ?? "", recipe.FileName);
+                moduleAvailability[recipe.ModuleName] = File.Exists(path);
+            }
+            else
+            {
+                moduleAvailability[m.ModuleName] = true;
+            }
+        }
+
+        _applyGvScheduled = false;
+        Repaint();
+    }
+
+    // vervang je bestaande CopyDirectoryNoMeta door deze
+    void CopyDirectoryNoMeta(string src, string dst, string skipSubtree = null)
+    {
+        // Beveiliging: nooit in eigen subtree kopiëren
+        if (IsSubPathOf(dst, src) || NormalizePath(dst) == NormalizePath(src))
+        {
+            Debug.LogError($"[ModDesigner] Refusing to copy '{src}' into its own subtree '{dst}'.");
+            return;
+        }
+
+        Directory.CreateDirectory(dst);
+
+        foreach (var f in Directory.GetFiles(src, "*", SearchOption.TopDirectoryOnly))
+        {
+            if (Path.GetExtension(f).Equals(".meta", StringComparison.OrdinalIgnoreCase)) continue;
+            File.Copy(f, Path.Combine(dst, Path.GetFileName(f)), true);
+        }
+
+        foreach (var d in Directory.GetDirectories(src, "*", SearchOption.TopDirectoryOnly))
+        {
+            // skip de net aangemaakte GV (of andere uitgesloten subtree)
+            if (!string.IsNullOrEmpty(skipSubtree) &&
+                (NormalizePath(d) == NormalizePath(skipSubtree) || IsSubPathOf(d, skipSubtree)))
+                continue;
+
+            CopyDirectoryNoMeta(d, Path.Combine(dst, Path.GetFileName(d)), skipSubtree);
         }
     }
+
+
+    void NewGameVersionFlow()
+    {
+        if (selectedModIndex < 0 || selectedModIndex >= mods.Count) return;
+        var mod = mods[selectedModIndex];
+
+        if (!EditorPrompt.PromptString("New Game Version", "Version (e.g. A21.2 or 2.4):", "A21.2", out var newGv)) return;
+        newGv = newGv.Trim();
+        if (string.IsNullOrEmpty(newGv)) return;
+
+        if (currentManifest == null) currentManifest = new ModManifest();
+
+        // <<< verplaats deze omhoog
+        PruneManifestVersionsForSelectedMod(save: true);
+
+        // pas nu checken
+        if (currentManifest.versions.ContainsKey(newGv))
+        {
+            EditorUtility.DisplayDialog("Exists", $"Game version '{newGv}' already exists.", "OK");
+            return;
+        }
+
+        bool firstEver = (currentManifest.ListGameVersions().Length == 0);
+
+        // --- bron bepalen ---
+        string src = null;
+        string srcLabel = "(none)";
+        if (firstEver && Directory.Exists(gameConfigPath))
+        {
+            src = gameConfigPath;                  // Base game Data/Config
+            srcLabel = "(Base Game Data/Config)";
+        }
+        else
+        {
+            var options = new List<string>();
+            var gvList = currentManifest.ListGameVersions();
+            options.AddRange(gvList);
+
+            var legacyCfg = ResolveConfigFolder(mod.ModFolder);
+            bool hasLegacy = !string.IsNullOrEmpty(legacyCfg) && Directory.Exists(legacyCfg);
+            if (Directory.Exists(gameConfigPath)) options.Insert(0, "(Base Game Data/Config)");
+            if (hasLegacy) options.Add("(Legacy XML/Config)");
+
+            int pick = EntryXmlModule.SimpleListPicker.Show(
+                "Copy from which version?",
+                "Choose a source to import from",
+                options.ToArray()
+            );
+
+            if (pick >= 0)
+            {
+                string chosen = options[pick];
+                srcLabel = chosen;
+                if (chosen == "(Base Game Data/Config)") src = gameConfigPath;
+                else if (chosen == "(Legacy XML/Config)") src = legacyCfg;
+                else src = Path.Combine(VersionRootFor(mod), chosen, "Config"); // GV binnen je mod
+            }
+        }
+
+        // --- bestemmingspaden ---
+        string destGvRoot = Path.Combine(VersionRootFor(mod), newGv);   // XML/<newGv>
+        string destConfig = Path.Combine(destGvRoot, "Config");
+
+        // Bestemming vol? Alleen checken als hij al bestond
+        if (Directory.Exists(destGvRoot) && DirHasContent(destGvRoot))
+        {
+            int how = EditorUtility.DisplayDialogComplex(
+                "Destination not empty",
+                $"Destination has content:\n{destGvRoot}\n\nHow to proceed?",
+                "Replace (clean first)", "Merge", "Cancel");
+            if (how == 2) return;
+            if (how == 0) ClearDirectory(destGvRoot);
+        }
+
+        // --- detecteer of bron een GV-root binnen deze mod is ---
+        string srcGvRoot = null;
+        if (!string.IsNullOrEmpty(src))
+        {
+            var parent = Directory.GetParent(src)?.FullName; // verwacht XML/<oldGv>
+            var versionRoot = VersionRootFor(mod);           // ...\XML
+
+            // Alleen GV-root als parent een submap is van XML én niet exact de XML-map zelf,
+            // én er een Config-submap onder zit.
+            if (!string.IsNullOrEmpty(parent) &&
+                IsSubPathOf(parent, versionRoot) &&
+                !string.Equals(NormalizePath(parent), NormalizePath(versionRoot), StringComparison.OrdinalIgnoreCase) &&
+                Directory.Exists(Path.Combine(parent, "Config")))
+            {
+                srcGvRoot = parent; // bv ...\XML\2.3
+            }
+        }
+
+
+        // --- importmodus ---
+        int importChoice = 2; // 0=Copy, 1=Move, 2=Skip
+        if (!string.IsNullOrEmpty(src) && Directory.Exists(src))
+        {
+            bool canMove = !string.IsNullOrEmpty(srcGvRoot); // move alleen als bron een echte GV-root is
+
+            if (canMove)
+            {
+                importChoice = EditorUtility.DisplayDialogComplex(
+                    "Import files",
+                    $"Import from:\n{srcLabel}\n{src}\n\nChoose import mode:",
+                    "Copy", "Move (copy, then delete source)", "Skip");
+            }
+            else
+            {
+                bool copy = EditorUtility.DisplayDialog(
+                    "Import files",
+                    $"Import from:\n{srcLabel}\n{src}\n\nMove is not available for this source.",
+                    "Copy", "Cancel");
+                importChoice = copy ? 0 : 2;
+            }
+        }
+
+
+        // --- kopiëren met preview ---
+        List<CopyCandidate> plan = BuildNewGvCopyCandidates(mod, newGv, src, srcGvRoot);
+
+        // Bestemmingspaden
+        Directory.CreateDirectory(destGvRoot);
+
+        // Laat preview met vinkjes zien
+        string srcNice =
+            !string.IsNullOrEmpty(srcGvRoot) ? srcGvRoot :
+            (!string.IsNullOrEmpty(src) ? src : "(none)");
+
+        bool ok = CopyPreviewWindow.Show(
+            title: "Kopiëren naar nieuwe versie",
+            subtitle: $"Bron: {srcLabel}\n{srcNice}\nDoel: {destGvRoot}",
+            destPath: destGvRoot,
+            items: plan
+        );
+        if (!ok) return;
+
+        // Uitvoeren
+        ExecuteCopyCandidates(destGvRoot, plan);
+
+        // Indien gebruiker 'Move' gekozen had: bron opruimen met extra 'Toon nieuwe mod map' knop
+        if (importChoice == 1 && !string.IsNullOrEmpty(src))
+        {
+            string toDelete = !string.IsNullOrEmpty(srcGvRoot) ? srcGvRoot : src;
+            var versionRoot = VersionRootFor(mod);
+            var legacyConfig = Path.Combine(versionRoot, "Config");
+
+            if (string.Equals(NormalizePath(toDelete), NormalizePath(versionRoot), StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(NormalizePath(toDelete), NormalizePath(legacyConfig), StringComparison.OrdinalIgnoreCase))
+            {
+                Debug.LogWarning("[ModDesigner] Skipping delete of XML root/legacy Config.");
+            }
+            else
+            {
+                SafeDeleteSourceTreeIfAllowed(toDelete, mod, destGvRoot);
+            }
+        }
+
+
+        // --- zorg dat er ModInfo.xml is in de nieuwe GV-root ---
+        Directory.CreateDirectory(destGvRoot); // maak nu pas zeker aan
+        string gvModInfo = Path.Combine(destGvRoot, "ModInfo.xml");
+        if (!File.Exists(gvModInfo))
+        {
+            // probeer nog een fallback ModInfo te vinden (XML/ModInfo.xml of root/ModInfo.xml)
+            string srcModInfo = null;
+            string rootXmlModInfo = Path.Combine(mod.ModFolder, "XML", "ModInfo.xml");
+            string legacyModInfo = Path.Combine(mod.ModFolder, "ModInfo.xml");
+            if (File.Exists(rootXmlModInfo)) srcModInfo = rootXmlModInfo;
+            else if (File.Exists(legacyModInfo)) srcModInfo = legacyModInfo;
+
+            if (!string.IsNullOrEmpty(srcModInfo))
+                File.Copy(srcModInfo, gvModInfo, true);
+            else
+            {
+                File.WriteAllText(gvModInfo,
+    $@"<?xml version=""1.0"" encoding=""UTF-8""?>
+<xml><ModInfo>
+  <Name value=""{mod.Name}""/>
+  <DisplayName value=""{mod.Name}""/>
+  <Description value=""Created with Mod Designer"" />
+  <Author value=""You""/>
+  <Version value=""{ComposeFullVersionString(newGv, "1.0")}""/>
+  <Website value="""" />
+</ModInfo></xml>");
+            }
+        }
+
+        // --- manifest bijwerken ---
+        var gvi = new ModManifest.GameVersionInfo
+        {
+            modVersion = "1.0",
+            unity = "",
+            locked = false
+        };
+        if (firstEver && TryDetectUnityFromInstall(out var unityVer) && !string.IsNullOrEmpty(unityVer))
+            gvi.unity = unityVer;
+
+        currentManifest.versions[newGv] = gvi;
+        currentManifest.currentGameVersion = newGv;
+        selectedGameVersion = newGv;
+        lastSelectedGvPerMod[mod.Name] = selectedGameVersion;
+
+        SaveManifestForSelected();
+        ApplySelectedGameVersionToContext();
+    }
+
+
+
+    bool TryDetectUnityFromInstall(out string unityVer)
+    {
+        unityVer = "";
+        try
+        {
+            if (string.IsNullOrEmpty(gameConfigPath) || !Directory.Exists(gameConfigPath)) return false;
+            // gameConfigPath = .../Data/Config → gameRoot = twee niveaus omhoog
+            var dataDir = Directory.GetParent(gameConfigPath);
+            var gameRoot = dataDir?.Parent?.FullName;
+            if (string.IsNullOrEmpty(gameRoot) || !Directory.Exists(gameRoot)) return false;
+            return UnityVersionUtil.TryGetUnityFromUnityPlayer(gameRoot, out unityVer);
+        }
+        catch { return false; }
+    }
+
+
+
+    void RenameGameVersionFlow()
+    {
+        if (selectedModIndex < 0 || selectedModIndex >= mods.Count) return;
+        if (string.IsNullOrEmpty(selectedGameVersion))
+        {
+            EditorUtility.DisplayDialog("No version", "Select a game version first.", "OK"); return;
+        }
+        var mod = mods[selectedModIndex];
+        if (!EditorPrompt.PromptString("Rename Game Version", "New name (e.g. 2.5):", selectedGameVersion, out var newName)) return;
+        newName = newName.Trim();
+        if (string.IsNullOrEmpty(newName) || newName == selectedGameVersion) return;
+
+        string oldDir = Path.Combine(VersionRootFor(mod), selectedGameVersion);
+        string newDir = Path.Combine(VersionRootFor(mod), newName);
+        if (Directory.Exists(newDir))
+        {
+            EditorUtility.DisplayDialog("Exists", $"Folder for '{newName}' already exists.", "OK"); return;
+        }
+
+        if (Directory.Exists(oldDir)) Directory.Move(oldDir, newDir);
+        if (currentManifest != null && currentManifest.versions.ContainsKey(selectedGameVersion))
+        {
+            currentManifest.versions[newName] = currentManifest.versions[selectedGameVersion];
+            currentManifest.versions.Remove(selectedGameVersion);
+        }
+
+        selectedGameVersion = newName;
+        SaveManifestForSelected();
+        ApplySelectedGameVersionToContext();
+    }
+
+    void DeleteGameVersionFlow()
+    {
+        if (selectedModIndex < 0 || selectedModIndex >= mods.Count) return;
+        if (string.IsNullOrEmpty(selectedGameVersion))
+        {
+            EditorUtility.DisplayDialog("No version", "Select a game version first.", "OK"); return;
+        }
+        var mod = mods[selectedModIndex];
+
+        // safety
+        if (currentManifest?.versions.TryGetValue(selectedGameVersion, out var gvi) == true && gvi.locked)
+        {
+            EditorUtility.DisplayDialog("Locked", "Unlock this version first.", "OK"); return;
+        }
+
+        if (!EditorUtility.DisplayDialog("Delete", $"Delete game version '{selectedGameVersion}'?\n(This removes XML/{selectedGameVersion} folder)", "Yes", "No"))
+            return;
+
+        string dir = Path.Combine(VersionRootFor(mod), selectedGameVersion);
+        if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        currentManifest?.versions.Remove(selectedGameVersion);
+
+        // kies nieuwe selectie
+        var all = currentManifest?.ListGameVersions() ?? new string[0];
+        selectedGameVersion = all.FirstOrDefault() ?? "";
+        PruneManifestVersionsForSelectedMod(save: true);
+        SaveManifestForSelected();
+        ApplySelectedGameVersionToContext();
+    }
+
+    void ToggleLockForSelectedVersion()
+    {
+        if (string.IsNullOrEmpty(selectedGameVersion) || currentManifest == null) return;
+        var gvi = currentManifest.GetOrCreate(selectedGameVersion);
+        gvi.locked = !gvi.locked;
+        SaveManifestForSelected();
+        ApplySelectedGameVersionToContext();
+    }
+
+    void SetModVersionForSelected(string newVersion)
+    {
+        if (currentManifest == null) return;
+
+        // Zorg dat er een geldige GV is
+        EnsureSelectedGvIsValid();
+        if (string.IsNullOrEmpty(selectedGameVersion))
+        {
+            EditorUtility.DisplayDialog("No Game Version", "Create or select a Game Version first.", "OK");
+            return;
+        }
+
+        var gvi = currentManifest.GetOrCreate(selectedGameVersion);
+        gvi.modVersion = string.IsNullOrWhiteSpace(newVersion) ? "1.0" : newVersion.Trim();
+
+        // Meteen naar disk
+        currentManifest.Save(mods[selectedModIndex].ModFolder);
+    }
+
+
+    string ComposeFullVersionString(string gameVersion, string modVersion)
+    {
+        // "2.4" + "1.1" => "2.4.1.1"
+        gameVersion = (gameVersion ?? "").Trim('.');
+        modVersion = (modVersion ?? "").Trim('.');
+        if (string.IsNullOrEmpty(gameVersion)) return string.IsNullOrEmpty(modVersion) ? "1.0" : modVersion;
+        if (string.IsNullOrEmpty(modVersion)) return gameVersion;
+        return gameVersion + "." + modVersion;
+    }
+
+    void EnsureSelectedGvIsValid(bool scheduleApply = true)
+    {
+        if (currentManifest == null) return;
+        var versions = currentManifest.ListGameVersions();
+        if (versions == null || versions.Length == 0) return;
+
+        if (string.IsNullOrEmpty(selectedGameVersion) ||
+            Array.IndexOf(versions, selectedGameVersion) < 0)
+        {
+            var mod = (selectedModIndex >= 0 && selectedModIndex < mods.Count) ? mods[selectedModIndex] : null;
+            selectedGameVersion = versions[0];
+            if (mod != null) lastSelectedGvPerMod[mod.Name] = selectedGameVersion;
+            SaveManifestForSelected();
+
+            if (scheduleApply)
+            {
+                if (!_applyGvScheduled)
+                {
+                    _applyGvScheduled = true;
+                    EditorApplication.delayCall += () =>
+                    {
+                        ApplySelectedGameVersionToContext();
+                    };
+                }
+            }
+        }
+    }
+
+    // --- helpers om copy candidates op te bouwen en uit te voeren ---
+    List<CopyCandidate> BuildNewGvCopyCandidates(ModEntry mod, string chosenGv, string src, string srcGvRoot)
+    {
+        // Doel: altijd de juiste set tonen: Config + (ModInfo, ModSettings, readme's)
+        var items = new List<CopyCandidate>();
+        string xmlRoot = Path.Combine(mod.ModFolder, "XML");
+        string destRootName = chosenGv; // komt terecht in XML/<gv>
+
+        // 1) Config directory bepalen
+        //    - als srcGvRoot != null -> Config zit onder srcGvRoot/Config
+        //    - anders: als src wijst naar een Config-map -> die
+        //    - anders: probeer legacy Config: mod.XML/Config
+        string srcConfig =
+            !string.IsNullOrEmpty(srcGvRoot) ? Path.Combine(srcGvRoot, "Config") :
+            (!string.IsNullOrEmpty(src) && Directory.Exists(src) && Path.GetFileName(src).Equals("Config", StringComparison.OrdinalIgnoreCase)) ? src :
+            Path.Combine(xmlRoot, "Config");
+
+        if (Directory.Exists(srcConfig))
+            items.Add(new CopyCandidate { Label = "Config/", SourcePath = srcConfig, DestRelPath = "Config", IsDir = true });
+
+        // 2) ModInfo.xml: probeer in volgorde gv-root -> XML -> root
+        var candidatesModInfo = new[]
+        {
+        !string.IsNullOrEmpty(srcGvRoot) ? Path.Combine(srcGvRoot, "ModInfo.xml") : null,
+        Path.Combine(xmlRoot, "ModInfo.xml"),
+        Path.Combine(mod.ModFolder, "ModInfo.xml")
+    }.Where(p => !string.IsNullOrEmpty(p)).ToList();
+
+        string pickModInfo = candidatesModInfo.FirstOrDefault(File.Exists);
+        if (!string.IsNullOrEmpty(pickModInfo))
+        {
+            items.Add(new CopyCandidate { Label = "ModInfo.xml", SourcePath = pickModInfo, DestRelPath = "ModInfo.xml", IsDir = false });
+        }
+        else
+        {
+            // Virtueel item: genereren als de gebruiker dit aanvinkt
+            items.Add(new CopyCandidate { Label = "ModInfo.xml (genereren)", SourcePath = "", DestRelPath = "ModInfo.xml", IsDir = false, IsVirtualGenerate = true });
+        }
+
+        // 3) ModSettings (xml/txt) – neem de eerste die bestaat
+        var modSettingsNames = new[] { "ModSettings.xml", "ModSettings.txt", "modsettings.txt" };
+        string pickSettings =
+            (!string.IsNullOrEmpty(srcGvRoot) ? modSettingsNames.Select(n => Path.Combine(srcGvRoot, n)).FirstOrDefault(File.Exists) : null)
+            ?? modSettingsNames.Select(n => Path.Combine(xmlRoot, n)).FirstOrDefault(File.Exists)
+            ?? modSettingsNames.Select(n => Path.Combine(mod.ModFolder, n)).FirstOrDefault(File.Exists);
+        if (!string.IsNullOrEmpty(pickSettings))
+        {
+            items.Add(new CopyCandidate
+            {
+                Label = Path.GetFileName(pickSettings),
+                SourcePath = pickSettings,
+                DestRelPath = Path.GetFileName(pickSettings),
+                IsDir = false
+            });
+        }
+
+        // 4) readme.* (md/txt)
+        string pickReadme =
+            (!string.IsNullOrEmpty(srcGvRoot) ? new[] { "readme.md", "readme.txt" }.Select(n => Path.Combine(srcGvRoot, n)).FirstOrDefault(File.Exists) : null)
+            ?? new[] { "readme.md", "readme.txt" }.Select(n => Path.Combine(xmlRoot, n)).FirstOrDefault(File.Exists)
+            ?? new[] { "readme.md", "readme.txt" }.Select(n => Path.Combine(mod.ModFolder, n)).FirstOrDefault(File.Exists);
+        if (!string.IsNullOrEmpty(pickReadme))
+        {
+            items.Add(new CopyCandidate
+            {
+                Label = Path.GetFileName(pickReadme),
+                SourcePath = pickReadme,
+                DestRelPath = Path.GetFileName(pickReadme),
+                IsDir = false
+            });
+        }
+
+        return items;
+    }
+
+    void ExecuteCopyCandidates(string destGvRoot, List<CopyCandidate> items)
+    {
+        Directory.CreateDirectory(destGvRoot);
+        foreach (var it in items.Where(i => i.Selected))
+        {
+            string destAbs = Path.Combine(destGvRoot, it.DestRelPath);
+            if (it.IsVirtualGenerate)
+            {
+                // minimale ModInfo.xml genereren (zelfde schema als elders in je code)
+                File.WriteAllText(destAbs,
+    $@"<?xml version=""1.0"" encoding=""UTF-8""?>
+<xml><ModInfo>
+  <Name value=""{mods[selectedModIndex].Name}""/>
+  <DisplayName value=""{mods[selectedModIndex].Name}""/>
+  <Description value=""Created with Mod Designer"" />
+  <Author value=""You""/>
+  <Version value=""{ComposeFullVersionString(selectedGameVersion, currentManifest?.GetOrCreate(selectedGameVersion)?.modVersion ?? "1.0")}""/>
+  <Website value="""" />
+</ModInfo></xml>");
+                continue;
+            }
+
+            if (it.IsDir)
+            {
+                CopyDirectoryNoMeta(it.SourcePath, destAbs);
+            }
+            else
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(destAbs) ?? "");
+                File.Copy(it.SourcePath, destAbs, true);
+            }
+        }
+    }
+
+    void PruneManifestVersionsForSelectedMod(bool save = true)
+    {
+        if (selectedModIndex < 0 || selectedModIndex >= mods.Count) return;
+        if (currentManifest == null) return;
+
+        var mod = mods[selectedModIndex];
+        string versionRoot = VersionRootFor(mod); // ...\XML
+
+        var toRemove = new List<string>();
+        foreach (var kv in currentManifest.versions)
+        {
+            string gv = kv.Key;
+            string gvDir = Path.Combine(versionRoot, gv);
+            // We beschouwen een versie alleen geldig als de versie-map bestaat én er een Config-submap is
+            bool exists = Directory.Exists(gvDir) && Directory.Exists(Path.Combine(gvDir, "Config"));
+            if (!exists) toRemove.Add(gv);
+        }
+
+        // verwijder uit manifest
+        foreach (var gv in toRemove) currentManifest.versions.Remove(gv);
+
+        // als currentGameVersion of de cached selectie wegvalt, zet nieuwe veilige waarde
+        bool touchedSelection = false;
+        if (toRemove.Contains(currentManifest.currentGameVersion ?? ""))
+        {
+            currentManifest.currentGameVersion = currentManifest.ListGameVersions().FirstOrDefault() ?? "";
+            selectedGameVersion = currentManifest.currentGameVersion;
+            touchedSelection = true;
+        }
+
+        if (lastSelectedGvPerMod.TryGetValue(mod.Name, out var cached) && toRemove.Contains(cached))
+        {
+            // zet naar huidige geldige selectie of verwijder cache
+            if (!string.IsNullOrEmpty(selectedGameVersion))
+                lastSelectedGvPerMod[mod.Name] = selectedGameVersion;
+            else
+                lastSelectedGvPerMod.Remove(mod.Name);
+            touchedSelection = true;
+        }
+
+        if (touchedSelection) Repaint();
+        if (save) currentManifest.Save(mod.ModFolder);
+    }
+
 }

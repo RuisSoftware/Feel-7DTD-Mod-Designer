@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<blocks>
+  <block name="couchUglySmallPinkCustom">
+    <property name="Extends" value="couchUglySmallPink" />
+    <property name="CustomIcon" value="couchUglySmallWhite" />
+    <property name="CustomIconTint" value="6F666E" />
+    <property name="TintColor" value="6F666E" />
+    <property name="SortOrder2" value="0110" />
+  </block>
+</blocks>

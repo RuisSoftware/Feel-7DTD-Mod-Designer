@@ -347,103 +347,111 @@ public class EntryXmlModule : IConfigModule
             EditorStyles.miniLabel
         );
 
-        // Search bar and reload button
-        EditorGUILayout.BeginHorizontal();
-        search = EditorGUILayout.TextField(search, (GUIStyle)"SearchTextField");
-        if (GUILayout.Button("×", (GUIStyle)"SearchCancelButton", GUILayout.Width(18)))
+        if (ctx?.IsVersionLocked == true)
         {
-            search = "";
-            RebuildEntries();
+            EditorGUILayout.HelpBox($"Game version '{ctx.SelectedGameVersion}' is LOCKED. Editing is disabled.", MessageType.Warning);
         }
-        if (GUILayout.Button("Reload", GUILayout.Width(70)))
+
+        using (new EditorGUI.DisabledGroupScope(ctx?.IsVersionLocked == true))
         {
-            if (!string.IsNullOrEmpty(filePath) && File.Exists(filePath))
+            // Search bar and reload button
+            EditorGUILayout.BeginHorizontal();
+            search = EditorGUILayout.TextField(search, (GUIStyle)"SearchTextField");
+            if (GUILayout.Button("×", (GUIStyle)"SearchCancelButton", GUILayout.Width(18)))
             {
-                try { doc = XDocument.Load(filePath); }
-                catch (Exception ex)
+                search = "";
+                RebuildEntries();
+            }
+            if (GUILayout.Button("Reload", GUILayout.Width(70)))
+            {
+                if (!string.IsNullOrEmpty(filePath) && File.Exists(filePath))
                 {
-                    EditorUtility.DisplayDialog("Load failed", ex.Message, "OK");
+                    try { doc = XDocument.Load(filePath); }
+                    catch (Exception ex)
+                    {
+                        EditorUtility.DisplayDialog("Load failed", ex.Message, "OK");
+                        doc = null;
+                    }
+                }
+                else
+                {
                     doc = null;
                 }
-            }
-            else
-            {
-                doc = null;
-            }
-            InvalidateBaseGameCaches(); // <-- NIEUW
-            RebuildEntries();
-            RebuildPatches();
-            BuildValidNameIndex();
-        }
-        EditorGUILayout.EndHorizontal();
-
-        // Top buttons: New (with submenu) + Import + Delete + Move
-        EditorGUILayout.BeginHorizontal();
-        if (GUILayout.Button("+ New"))
-        {
-            var menu = new GenericMenu();
-            if (entryTag != null)
-            {
-                string entryTypeName = char.ToUpper(entryTag[0]) + entryTag.Substring(1);
-                menu.AddItem(new GUIContent($"New {entryTypeName}"), false, () =>
-                {
-                    if (EditorPrompt.PromptString($"New {entryTag}", "Name:", "newEntry", out var nm))
-                    {
-                        if (doc == null && !EnsureDocumentCreated()) return;
-                        if (doc.Descendants(entryTag).Any(e => (string)e.Attribute("name") == nm))
-                        {
-                            EditorUtility.DisplayDialog("Already exists", $"{entryTag} '{nm}' already exists.", "OK");
-                        }
-                        else
-                        {
-                            var parent = GetDefaultParentForNewEntry();
-                            var el = new XElement(entryTag, new XAttribute("name", nm));
-                            parent.Add(el);
-                            dirty = true;
-                            RebuildEntries();
-                            selectedIndex = entries.IndexOf(el);
-                            selPatch = -1;
-                            selectedPatchEl = null;
-                        }
-                    }
-                });
-            }
-            menu.AddItem(new GUIContent("Append Patch"), false, AddAppendPatch);
-            menu.AddItem(new GUIContent("Set Patch"), false, AddSetPatch);
-            menu.AddItem(new GUIContent("Remove Patch"), false, AddRemovePatch);
-            menu.DropDown(new Rect(Event.current.mousePosition, Vector2.zero));
-        }
-
-        if (entryTag != null && GUILayout.Button("Import"))
-        {
-            if (doc == null && !EnsureDocumentCreated()) { /* noop */ }
-            else EditorApplication.delayCall += ImportFromBaseGame;
-        }
-        GUI.enabled = selectedIndex >= 0 && selectedIndex < entries.Count;
-        if (GUILayout.Button("- Delete"))
-        {
-            var el = entries.ElementAtOrDefault(selectedIndex);
-            string elName = (string?)el?.Attribute("name") ?? "(unnamed)";
-            if (el != null && EditorUtility.DisplayDialog("Delete", $"Delete '{elName}'?", "Yes", "No"))
-            {
-                string nameKey = (string)el.Attribute("name")!;
-                XElement descProp = el.Element("property");
-                string descKey = descProp != null && (string)descProp.Attribute("name") == "DescriptionKey"
-                                    ? (string)descProp.Attribute("value") : null;
-
-                el.Remove();
-                dirty = true;
+                InvalidateBaseGameCaches(); // <-- NIEUW
                 RebuildEntries();
-                selectedIndex = -1;
-
-                ctx.LocalizationEntries.Remove(nameKey);
-                if (!string.IsNullOrEmpty(descKey)) ctx.LocalizationEntries.Remove(descKey);
+                RebuildPatches();
+                BuildValidNameIndex();
             }
+            EditorGUILayout.EndHorizontal();
+
+            // Top buttons: New (with submenu) + Import + Delete + Move
+            EditorGUILayout.BeginHorizontal();
+            if (GUILayout.Button("+ New"))
+            {
+                var menu = new GenericMenu();
+                if (entryTag != null)
+                {
+                    string entryTypeName = char.ToUpper(entryTag[0]) + entryTag.Substring(1);
+                    menu.AddItem(new GUIContent($"New {entryTypeName}"), false, () =>
+                    {
+                        if (EditorPrompt.PromptString($"New {entryTag}", "Name:", "newEntry", out var nm))
+                        {
+                            if (doc == null && !EnsureDocumentCreated()) return;
+                            if (doc.Descendants(entryTag).Any(e => (string)e.Attribute("name") == nm))
+                            {
+                                EditorUtility.DisplayDialog("Already exists", $"{entryTag} '{nm}' already exists.", "OK");
+                            }
+                            else
+                            {
+                                var parent = GetDefaultParentForNewEntry();
+                                var el = new XElement(entryTag, new XAttribute("name", nm));
+                                parent.Add(el);
+                                dirty = true;
+                                RebuildEntries();
+                                selectedIndex = entries.IndexOf(el);
+                                selPatch = -1;
+                                selectedPatchEl = null;
+                            }
+                        }
+                    });
+                }
+                menu.AddItem(new GUIContent("Append Patch"), false, AddAppendPatch);
+                menu.AddItem(new GUIContent("Set Patch"), false, AddSetPatch);
+                menu.AddItem(new GUIContent("Remove Patch"), false, AddRemovePatch);
+                menu.DropDown(new Rect(Event.current.mousePosition, Vector2.zero));
+            }
+
+            if (entryTag != null && GUILayout.Button("Import"))
+            {
+                if (doc == null && !EnsureDocumentCreated()) { /* noop */ }
+                else EditorApplication.delayCall += ImportFromBaseGame;
+            }
+            GUI.enabled = selectedIndex >= 0 && selectedIndex < entries.Count;
+            if (GUILayout.Button("- Delete"))
+            {
+                var el = entries.ElementAtOrDefault(selectedIndex);
+                string elName = (string?)el?.Attribute("name") ?? "(unnamed)";
+                if (el != null && EditorUtility.DisplayDialog("Delete", $"Delete '{elName}'?", "Yes", "No"))
+                {
+                    string nameKey = (string)el.Attribute("name")!;
+                    XElement descProp = el.Element("property");
+                    string descKey = descProp != null && (string)descProp.Attribute("name") == "DescriptionKey"
+                                        ? (string)descProp.Attribute("value") : null;
+
+                    el.Remove();
+                    dirty = true;
+                    RebuildEntries();
+                    selectedIndex = -1;
+
+                    ctx.LocalizationEntries.Remove(nameKey);
+                    if (!string.IsNullOrEmpty(descKey)) ctx.LocalizationEntries.Remove(descKey);
+                }
+            }
+            if (GUILayout.Button("▲")) { MoveEntry(-1); }
+            if (GUILayout.Button("▼")) { MoveEntry(+1); }
+            GUI.enabled = true;
+            EditorGUILayout.EndHorizontal();
         }
-        if (GUILayout.Button("▲")) { MoveEntry(-1); }
-        if (GUILayout.Button("▼")) { MoveEntry(+1); }
-        GUI.enabled = true;
-        EditorGUILayout.EndHorizontal();
 
         // ---- PATCH LIST (clickable rows + multi-select) ----
         GUILayout.Space(4);
@@ -1356,6 +1364,13 @@ public class EntryXmlModule : IConfigModule
     public void Save()
     {
         if (!ctx.HasValidMod) return;
+
+        if (ctx.IsVersionLocked)
+        {
+            EditorUtility.DisplayDialog("Locked",
+                $"Cannot save: game version '{ctx.SelectedGameVersion}' is locked. Unlock in the top bar.", "OK");
+            return;
+        }
 
         bool wroteAnything = false;
 

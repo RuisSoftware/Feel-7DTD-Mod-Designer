@@ -1,0 +1,8 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<recipes>
+  <recipe name="ammoArrowStone" count="1" tags="packMuleCrafting">
+    <ingredient name="resourceRockSmall" count="1" />
+    <ingredient name="resourceWood" count="1" />
+    <ingredient name="resourceFeather" count="1" />
+  </recipe>
+</recipes>
