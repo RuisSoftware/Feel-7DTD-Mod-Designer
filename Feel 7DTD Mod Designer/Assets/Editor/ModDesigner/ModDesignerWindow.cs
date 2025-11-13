@@ -698,9 +698,7 @@ public class ModDesignerWindow : EditorWindow
 
     void ClearDirectory(string dir)
     {
-        if (!Directory.Exists(dir)) return;
-        foreach (var f in Directory.GetFiles(dir)) File.Delete(f);
-        foreach (var d in Directory.GetDirectories(dir)) Directory.Delete(d, true);
+        ClearDirectoryUnityAware(dir);
     }
 
     void SafeDeleteSourceTreeIfAllowed(string src, ModEntry mod, string newModFolderToShow = null)
@@ -751,13 +749,13 @@ public class ModDesignerWindow : EditorWindow
                     // loop terug naar confirm
                     continue;
                 }
-
                 // res == 0 → Delete
-                Directory.Delete(src, true);
+                DeleteDirectoryAndMetas(src);
 
+                // Als de parent nu leeg is, verwijder die (incl. .meta) ook.
                 var parent = Path.GetDirectoryName(src);
                 if (!string.IsNullOrEmpty(parent) && Directory.Exists(parent) && !Directory.EnumerateFileSystemEntries(parent).Any())
-                    Directory.Delete(parent, true);
+                    DeleteDirectoryAndMetas(parent);
 
                 AssetDatabase.Refresh();
                 return;
@@ -817,11 +815,9 @@ public class ModDesignerWindow : EditorWindow
 
         // --- NIEUW: versie-gesegmenteerde exportmap ---
         string fullVersion = ComposeFullVersionString(chosenGv, gvi?.modVersion ?? "1.0");
-        string destRoot = Path.Combine(exportModsFolder, mod.Name + "_" + fullVersion);      // "ExportLocation/<Version>"
-        string destModPath = destRoot;              // binnen de versie-map komt de mod-map
+        string destModPath = Path.Combine(exportModsFolder, mod.Name + "_" + fullVersion);
         if (Directory.Exists(destModPath)) Directory.Delete(destModPath, true);
         Directory.CreateDirectory(destModPath);
-        Directory.CreateDirectory(destRoot);
 
         // --- ModInfo.xml schrijven (GV-specifiek prefereren) ---
         string srcModInfo =
@@ -1499,12 +1495,23 @@ public class ModDesignerWindow : EditorWindow
             }
         }
 
+        // --- guard: Move blokkeren als bron en doel identiek zijn ---
+        bool samePaths = !string.IsNullOrEmpty(srcGvRoot) &&
+            string.Equals(NormalizePath(srcGvRoot), NormalizePath(destGvRoot), StringComparison.OrdinalIgnoreCase);
+
+        if (importChoice == 1 && samePaths) // 1 = Move
+        {
+            Debug.LogWarning("[ModDesigner] Move skipped: source and destination are identical. Falling back to Copy.");
+            importChoice = 0; // degradeer naar Copy
+        }
+
+
 
         // --- kopiëren met preview ---
         List<CopyCandidate> plan = BuildNewGvCopyCandidates(mod, newGv, src, srcGvRoot);
 
         // Bestemmingspaden
-        Directory.CreateDirectory(destGvRoot);
+        // Directory.CreateDirectory(destGvRoot);
 
         // Laat preview met vinkjes zien
         string srcNice =
@@ -1520,7 +1527,7 @@ public class ModDesignerWindow : EditorWindow
         if (!ok) return;
 
         // Uitvoeren
-        ExecuteCopyCandidates(destGvRoot, plan);
+        bool wrote = ExecuteCopyCandidates(destGvRoot, plan, newGv);
 
         // Indien gebruiker 'Move' gekozen had: bron opruimen met extra 'Toon nieuwe mod map' knop
         if (importChoice == 1 && !string.IsNullOrEmpty(src))
@@ -1542,23 +1549,25 @@ public class ModDesignerWindow : EditorWindow
 
 
         // --- zorg dat er ModInfo.xml is in de nieuwe GV-root ---
-        Directory.CreateDirectory(destGvRoot); // maak nu pas zeker aan
-        string gvModInfo = Path.Combine(destGvRoot, "ModInfo.xml");
-        if (!File.Exists(gvModInfo))
+        // Alleen ModInfo forceren als er content is (of tenminste een Config-map)
+        bool hasConfig = Directory.Exists(Path.Combine(destGvRoot, "Config"));
+        if ((wrote || hasConfig))
         {
-            // probeer nog een fallback ModInfo te vinden (XML/ModInfo.xml of root/ModInfo.xml)
-            string srcModInfo = null;
-            string rootXmlModInfo = Path.Combine(mod.ModFolder, "XML", "ModInfo.xml");
-            string legacyModInfo = Path.Combine(mod.ModFolder, "ModInfo.xml");
-            if (File.Exists(rootXmlModInfo)) srcModInfo = rootXmlModInfo;
-            else if (File.Exists(legacyModInfo)) srcModInfo = legacyModInfo;
-
-            if (!string.IsNullOrEmpty(srcModInfo))
-                File.Copy(srcModInfo, gvModInfo, true);
-            else
+            Directory.CreateDirectory(destGvRoot);
+            string gvModInfo = Path.Combine(destGvRoot, "ModInfo.xml");
+            if (!File.Exists(gvModInfo))
             {
-                File.WriteAllText(gvModInfo,
-    $@"<?xml version=""1.0"" encoding=""UTF-8""?>
+                string srcModInfo = null;
+                string rootXmlModInfo = Path.Combine(mod.ModFolder, "XML", "ModInfo.xml");
+                string legacyModInfo = Path.Combine(mod.ModFolder, "ModInfo.xml");
+                if (File.Exists(rootXmlModInfo)) srcModInfo = rootXmlModInfo;
+                else if (File.Exists(legacyModInfo)) srcModInfo = legacyModInfo;
+
+                if (!string.IsNullOrEmpty(srcModInfo))
+                    File.Copy(srcModInfo, gvModInfo, true);
+                else
+                    File.WriteAllText(gvModInfo,
+        $@"<?xml version=""1.0"" encoding=""UTF-8""?>
 <xml><ModInfo>
   <Name value=""{mod.Name}""/>
   <DisplayName value=""{mod.Name}""/>
@@ -1569,6 +1578,7 @@ public class ModDesignerWindow : EditorWindow
 </ModInfo></xml>");
             }
         }
+
 
         // --- manifest bijwerken ---
         var gvi = new ModManifest.GameVersionInfo
@@ -1658,7 +1668,8 @@ public class ModDesignerWindow : EditorWindow
             return;
 
         string dir = Path.Combine(VersionRootFor(mod), selectedGameVersion);
-        if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        DeleteDirectoryAndMetas(dir);
+        AssetDatabase.Refresh();
         currentManifest?.versions.Remove(selectedGameVersion);
 
         // kies nieuwe selectie
@@ -1811,15 +1822,21 @@ public class ModDesignerWindow : EditorWindow
         return items;
     }
 
-    void ExecuteCopyCandidates(string destGvRoot, List<CopyCandidate> items)
+    bool ExecuteCopyCandidates(string destGvRoot, List<CopyCandidate> items, string versionForModInfo)
     {
-        Directory.CreateDirectory(destGvRoot);
+        bool wroteAny = false;
+
         foreach (var it in items.Where(i => i.Selected))
         {
             string destAbs = Path.Combine(destGvRoot, it.DestRelPath);
+
+            // zorg dat parent bestaat enkel wanneer nodig
+            Directory.CreateDirectory(Path.GetDirectoryName(destAbs) ?? "");
+
             if (it.IsVirtualGenerate)
             {
-                // minimale ModInfo.xml genereren (zelfde schema als elders in je code)
+                // minimale ModInfo.xml genereren voor de NIEUWE versie
+                Directory.CreateDirectory(destGvRoot);
                 File.WriteAllText(destAbs,
     $@"<?xml version=""1.0"" encoding=""UTF-8""?>
 <xml><ModInfo>
@@ -1827,23 +1844,29 @@ public class ModDesignerWindow : EditorWindow
   <DisplayName value=""{mods[selectedModIndex].Name}""/>
   <Description value=""Created with Mod Designer"" />
   <Author value=""You""/>
-  <Version value=""{ComposeFullVersionString(selectedGameVersion, currentManifest?.GetOrCreate(selectedGameVersion)?.modVersion ?? "1.0")}""/>
+  <Version value=""{ComposeFullVersionString(versionForModInfo, currentManifest?.GetOrCreate(versionForModInfo)?.modVersion ?? "1.0")}""/>
   <Website value="""" />
 </ModInfo></xml>");
+                wroteAny = true;
                 continue;
             }
 
             if (it.IsDir)
             {
                 CopyDirectoryNoMeta(it.SourcePath, destAbs);
+                wroteAny = true;
             }
             else
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(destAbs) ?? "");
                 File.Copy(it.SourcePath, destAbs, true);
+                wroteAny = true;
             }
         }
+
+        return wroteAny;
     }
+
 
     void PruneManifestVersionsForSelectedMod(bool save = true)
     {
@@ -1888,5 +1911,74 @@ public class ModDesignerWindow : EditorWindow
         if (touchedSelection) Repaint();
         if (save) currentManifest.Save(mod.ModFolder);
     }
+
+    // --- UNITY-AWARE DELETE HELPERS ---
+    // Probeert eerst via AssetDatabase (verwijdert .meta automatisch als pad onder Assets valt).
+    static bool TryDeleteAssetPath(string systemPath)
+    {
+        var assetPath = SystemPathToAssetPath(systemPath);
+        if (string.IsNullOrEmpty(assetPath)) return false;
+        if (string.Equals(assetPath, "Assets", StringComparison.OrdinalIgnoreCase)) return false;
+        return AssetDatabase.DeleteAsset(assetPath);
+    }
+
+    // Verwijder directory + ALLE .meta's (recursief). Valt terug op IO als AssetDatabase niet kan.
+    static void DeleteDirectoryAndMetas(string dir)
+    {
+        if (string.IsNullOrEmpty(dir)) return;
+
+        // 1) Probeer via AssetDatabase als het onder Assets staat
+        if (TryDeleteAssetPath(dir)) return;
+
+        // 2) Hard delete + .meta's
+        if (!Directory.Exists(dir))
+        {
+            var folderMeta = dir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + ".meta";
+            if (File.Exists(folderMeta)) File.Delete(folderMeta);
+            return;
+        }
+
+        foreach (var sub in Directory.GetDirectories(dir))
+            DeleteDirectoryAndMetas(sub);
+
+        foreach (var f in Directory.GetFiles(dir))
+        {
+            try
+            {
+                File.SetAttributes(f, FileAttributes.Normal);
+                File.Delete(f);
+                var meta = f + ".meta";
+                if (File.Exists(meta)) File.Delete(meta);
+            }
+            catch { /* ignore */ }
+        }
+
+        Directory.Delete(dir, true);
+
+        var thisMeta = dir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + ".meta";
+        if (File.Exists(thisMeta)) File.Delete(thisMeta);
+    }
+
+    // Leeg een map, inclusief .meta's van inhoud (maar laat de map zelf staan)
+    static void ClearDirectoryUnityAware(string dir)
+    {
+        if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+
+        foreach (var f in Directory.GetFiles(dir))
+        {
+            try
+            {
+                File.SetAttributes(f, FileAttributes.Normal);
+                File.Delete(f);
+                var meta = f + ".meta";
+                if (File.Exists(meta)) File.Delete(meta);
+            }
+            catch { /* ignore */ }
+        }
+
+        foreach (var d in Directory.GetDirectories(dir))
+            DeleteDirectoryAndMetas(d);
+    }
+
 
 }
