@@ -1,12 +1,6 @@
 ﻿// Assets/Editor/LootableMakerToolWindow.cs
-// Unity Editor tool for 7 Days To Die modding
-// - Scans blocks.xml for non-lootable blocks
-// - Shows icons (by name, CustomIcon, or ancestor Extends)
-// - Validates loot rows: red when item/block doesn't exist
-// - Inline autocomplete dropdown for item/block names
-// - Groups common pallets & materials for quick selection
-// - Skips blocks by name contains & by FilterTags
-// - Generates blocks.xml + loot.xml + ModInfo.xml + readme.md
+// Lootable Maker – category Select/Deselect/Invert, clear "no lootable yet" status,
+// stable IMGUI, ignored-tag skip, validation & autocomplete, performant icon loading.
 
 using System;
 using System.Collections.Generic;
@@ -34,7 +28,7 @@ public class LootableMakerToolWindow : EditorWindow
 
     // --- Mod meta ---
     private string modNameBase = "feel-lootables";
-    private string modVersion = "1.0.0";
+    private string modVersion = "1.0.2";
     private string modAuthor = "You";
     private string modWebsite = "";
     private string modDescription = "Generated with Lootable Maker";
@@ -49,8 +43,12 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
     private string search = "";
     private bool showOnlyWithIcon = false;
     private bool showIcons = true;
-    private string skipNameContainsCsv = "";       // e.g. palletEmpty
-    private string skipFilterTagsCsv = "SC_terrain";
+
+    private string skipNameContainsCsv = "";                 // name filters
+    private string skipFilterTagsCsv = "SC_terrain,ignored"; // tag filters (default includes 'ignored')
+
+    // Show only entries whose LootList name does NOT exist in vanilla
+    private bool onlyMissingLootList = false;
 
     // --- Loot defaults ---
     private int lootCountDefault = 1;
@@ -65,7 +63,7 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
     private int selectedIndex = -1;
     private readonly Dictionary<string, bool> groupFoldouts = new();
 
-    // icon throttling (avoid spikes with huge lists)
+    // icon throttling
     private const int IconLoadLimitPerFrame = 24;
     private int iconsLoadedThisFrame = 0;
 
@@ -74,18 +72,19 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
     private readonly Dictionary<string, XElement> blockByName = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Texture2D> iconCache = new(StringComparer.OrdinalIgnoreCase);
 
-    // item & block catalogs (for validation/autocomplete)
     private readonly HashSet<string> validItems = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> validBlocks = new(StringComparer.OrdinalIgnoreCase);
 
-    // suggestion state per (candidate,item) field
+    // vanilla lootcontainers
+    private readonly HashSet<string> lootContainers = new(StringComparer.OrdinalIgnoreCase);
+
     private readonly Dictionary<string, AutoSuggestState> suggestStates = new();
 
     [MenuItem("Tools/Feel 7DTD/Lootable Maker")]
     public static void ShowWindow()
     {
         var w = GetWindow<LootableMakerToolWindow>("Lootable Maker");
-        w.minSize = new Vector2(1000, 600);
+        w.minSize = new Vector2(1020, 620);
     }
 
     private void OnGUI()
@@ -104,14 +103,28 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
         using (new EditorGUILayout.HorizontalScope())
         {
             if (GUILayout.Button("Scan non-lootable blocks", GUILayout.Height(26))) Scan();
+
             GUI.enabled = scanned && candidates.Any(c => c.selected);
             if (GUILayout.Button("Generate Mod From Selection", GUILayout.Height(26))) GenerateMod();
             GUI.enabled = true;
+
             GUILayout.FlexibleSpace();
             showIcons = GUILayout.Toggle(showIcons, "Show icons", GUILayout.Width(100));
             showOnlyWithIcon = GUILayout.Toggle(showOnlyWithIcon, "Only with icon", GUILayout.Width(120));
+            onlyMissingLootList = GUILayout.Toggle(onlyMissingLootList, "Only missing LootList", GUILayout.Width(170));
             GUILayout.Space(6);
             search = GUILayout.TextField(search, GUILayout.Width(260));
+        }
+
+        // Legend
+        EditorGUILayout.Space(4);
+        using (new EditorGUILayout.HorizontalScope())
+        {
+            DrawPill("NOT LOOTABLE (vanilla)", new Color(0.85f, 0.55f, 0.15f, 0.85f));
+            GUILayout.Space(6);
+            DrawPill("No LootList (NEW)", new Color(0.7f, 0.2f, 0.2f, 0.9f));
+            GUILayout.Space(6);
+            DrawPill("LootList exists", new Color(0.2f, 0.6f, 0.2f, 0.85f));
         }
 
         EditorGUILayout.Space(6);
@@ -122,7 +135,7 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
             DrawDetailsPanel();
         }
 
-        // close stray popups on click outside
+        // clicking outside closes all suggestion popups
         if (Event.current.type == EventType.MouseDown && Event.current.button == 0)
         {
             foreach (var s in suggestStates.Values) s.open = false;
@@ -194,10 +207,10 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
             // Filters
             EditorGUILayout.LabelField("Skip blocks", EditorStyles.miniBoldLabel);
             skipNameContainsCsv = EditorGUILayout.TextField(
-                new GUIContent("Name contains (CSV)", "Blocks whose name contains any of these substrings are skipped."),
+                new GUIContent("Name contains (CSV)", "Skip blocks whose name contains any of these substrings."),
                 skipNameContainsCsv);
             skipFilterTagsCsv = EditorGUILayout.TextField(
-                new GUIContent("FilterTags contains (CSV)", "Blocks whose property FilterTags contains any of these tokens are skipped."),
+                new GUIContent("FilterTags contains (CSV)", "Skip blocks whose FilterTags contains any of these tokens (always also skips 'ignored')."),
                 skipFilterTagsCsv);
 
             EditorGUILayout.Space(6);
@@ -232,65 +245,105 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
             if (!scanned)
                 EditorGUILayout.HelpBox("Click Scan to load non-lootable blocks.", MessageType.Info);
 
-            var groups = FilteredCandidates()
+            // MATERIALIZE up-front to keep Layout/Repaint control counts identical
+            var filtered = FilteredCandidates().ToList();
+            var grouped = filtered
                 .GroupBy(c => Classify(c.blockName))
-                .OrderBy(g => g.Key);
+                .Select(g => new GroupBucket { Key = g.Key, Items = g.ToList() })
+                .OrderBy(g => g.Key)
+                .ToList();
 
-            foreach (var g in groups)
+            foreach (var bucket in grouped)
             {
-                bool open = GetFoldout(g.Key);
-                open = EditorGUILayout.Foldout(open, $"{g.Key}  ({g.Count()})", true);
-                groupFoldouts[g.Key] = open;
-                if (!open) continue;
+                bool open = GetFoldout(bucket.Key);
+                open = EditorGUILayout.BeginFoldoutHeaderGroup(open, $"{bucket.Key}  ({bucket.Items.Count})");
+                groupFoldouts[bucket.Key] = open;
 
-                foreach (var c in g)
+                if (open)
                 {
-                    using (new EditorGUILayout.HorizontalScope(EditorStyles.helpBox))
+                    // --- NEW: Category-wide select tools ---
+                    using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
                     {
-                        c.selected = EditorGUILayout.Toggle(c.selected, GUILayout.Width(18));
+                        GUILayout.Label("Category selection:", EditorStyles.miniLabel);
+                        if (GUILayout.Button("Select all", EditorStyles.toolbarButton, GUILayout.Width(80)))
+                            foreach (var c in bucket.Items) c.selected = true;
 
-                        // icon
-                        if (showIcons)
+                        if (GUILayout.Button("Deselect all", EditorStyles.toolbarButton, GUILayout.Width(90)))
+                            foreach (var c in bucket.Items) c.selected = false;
+
+                        if (GUILayout.Button("Invert", EditorStyles.toolbarButton, GUILayout.Width(60)))
+                            foreach (var c in bucket.Items) c.selected = !c.selected;
+
+                        GUILayout.FlexibleSpace();
+                    }
+
+                    foreach (var c in bucket.Items)
+                    {
+                        using (new EditorGUILayout.HorizontalScope(EditorStyles.helpBox))
                         {
-                            var tex = GetIconFor(c);
-                            GUILayout.Box(tex ? tex : Texture2D.grayTexture, GUILayout.Width(40), GUILayout.Height(40));
-                        }
+                            c.selected = EditorGUILayout.Toggle(c.selected, GUILayout.Width(18));
 
-                        // main
-                        using (new EditorGUILayout.VerticalScope())
-                        {
-                            EditorGUILayout.LabelField(c.blockName, EditorStyles.boldLabel);
-
-                            using (new EditorGUILayout.HorizontalScope())
+                            // icon – only resolve during REPAINT to avoid layout divergence
+                            if (showIcons)
                             {
-                                EditorGUILayout.PrefixLabel("LootList");
-                                c.lootListName = EditorGUILayout.TextField(c.lootListName ?? c.blockName);
+                                Texture2D tex = null;
+                                if (Event.current.type == EventType.Repaint)
+                                    tex = GetIconFor(c);
+                                GUILayout.Box(tex != null ? tex : Texture2D.grayTexture, GUILayout.Width(40), GUILayout.Height(40));
                             }
-                            using (new EditorGUILayout.HorizontalScope())
-                            {
-                                EditorGUILayout.PrefixLabel("Size");
-                                c.size = EditorGUILayout.TextField(string.IsNullOrEmpty(c.size) ? lootSizeDefault : c.size, GUILayout.Width(80));
-                                GUILayout.Space(10);
-                                EditorGUILayout.PrefixLabel("Count");
-                                c.count = EditorGUILayout.IntField(c.count == 0 ? lootCountDefault : c.count, GUILayout.Width(60));
-                            }
-                        }
 
-                        if (GUILayout.Button("Details", GUILayout.Width(70)))
-                            selectedIndex = candidates.IndexOf(c);
+                            using (new EditorGUILayout.VerticalScope())
+                            {
+                                EditorGUILayout.LabelField(c.blockName, EditorStyles.boldLabel);
+
+                                using (new EditorGUILayout.HorizontalScope())
+                                {
+                                    // Status pills:
+                                    DrawPill("NOT LOOTABLE (vanilla)", new Color(0.85f, 0.55f, 0.15f, 0.85f));
+
+                                    var lootName = string.IsNullOrWhiteSpace(c.lootListName) ? c.blockName : c.lootListName.Trim();
+                                    bool existsLL = LootListExists(lootName);
+
+                                    GUILayout.Space(6);
+                                    if (existsLL)
+                                        DrawPill("LootList exists", new Color(0.2f, 0.6f, 0.2f, 0.85f));
+                                    else
+                                        DrawPill("No LootList (NEW)", new Color(0.7f, 0.2f, 0.2f, 0.9f));
+                                }
+
+                                using (new EditorGUILayout.HorizontalScope())
+                                {
+                                    EditorGUILayout.PrefixLabel("LootList");
+                                    c.lootListName = EditorGUILayout.TextField(c.lootListName ?? c.blockName);
+                                }
+                                using (new EditorGUILayout.HorizontalScope())
+                                {
+                                    EditorGUILayout.PrefixLabel("Size");
+                                    c.size = EditorGUILayout.TextField(string.IsNullOrEmpty(c.size) ? lootSizeDefault : c.size, GUILayout.Width(80));
+                                    GUILayout.Space(10);
+                                    EditorGUILayout.PrefixLabel("Count");
+                                    c.count = EditorGUILayout.IntField(c.count == 0 ? lootCountDefault : c.count, GUILayout.Width(60));
+                                }
+                            }
+
+                            if (GUILayout.Button("Details", GUILayout.Width(70)))
+                                selectedIndex = candidates.IndexOf(c);
+                        }
                     }
                 }
+
+                EditorGUILayout.EndFoldoutHeaderGroup();
             }
 
-            if (scanned && !FilteredCandidates().Any())
+            if (scanned && filtered.Count == 0)
                 EditorGUILayout.HelpBox("No results with current search/filters.", MessageType.None);
 
             EditorGUILayout.EndScrollView();
 
             using (new EditorGUILayout.HorizontalScope())
             {
-                if (GUILayout.Button("Select all")) foreach (var c in FilteredCandidates()) c.selected = true;
-                if (GUILayout.Button("Deselect all")) foreach (var c in FilteredCandidates()) c.selected = false;
+                if (GUILayout.Button("Select all (shown)")) foreach (var c in filtered) c.selected = true;
+                if (GUILayout.Button("Deselect all (shown)")) foreach (var c in filtered) c.selected = false;
                 GUILayout.FlexibleSpace();
                 if (GUILayout.Button("Rescan")) Scan();
             }
@@ -307,6 +360,9 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
         if (showOnlyWithIcon)
             q = q.Where(c => GetIconFor(c) != null);
 
+        if (onlyMissingLootList)
+            q = q.Where(c => !LootListExists(string.IsNullOrWhiteSpace(c.lootListName) ? c.blockName : c.lootListName.Trim()));
+
         return q;
     }
 
@@ -314,7 +370,6 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
     {
         if (!groupFoldouts.TryGetValue(key, out var v))
         {
-            // Open common groups by default
             v = key.StartsWith("Pallet", StringComparison.OrdinalIgnoreCase);
             groupFoldouts[key] = v;
         }
@@ -363,8 +418,10 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
             else
             {
                 var c = candidates[selectedIndex];
-                var tex = showIcons ? (GetIconFor(c) ?? Texture2D.grayTexture) : Texture2D.grayTexture;
-                GUILayout.Box(tex, GUILayout.Width(64), GUILayout.Height(64));
+                Texture2D tex = null;
+                if (showIcons && Event.current.type == EventType.Repaint)
+                    tex = GetIconFor(c);
+                GUILayout.Box(tex != null ? tex : Texture2D.grayTexture, GUILayout.Width(64), GUILayout.Height(64));
 
                 EditorGUILayout.Space();
                 EditorGUILayout.LabelField("Block", EditorStyles.boldLabel);
@@ -376,6 +433,25 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
                 EditorGUILayout.LabelField("Lootcontainer", EditorStyles.boldLabel);
 
                 c.lootListName = EditorGUILayout.TextField("name", c.lootListName ?? c.blockName);
+                var lootName = string.IsNullOrWhiteSpace(c.lootListName) ? c.blockName : c.lootListName.Trim();
+                bool existsLL = LootListExists(lootName);
+
+                // explicit status about "no lootable yet"
+                if (!existsLL)
+                {
+                    EditorGUILayout.HelpBox(
+                        $"No lootcontainer named '{lootName}' exists in vanilla. " +
+                        "When generating, a NEW <lootcontainer> with this name will be added.",
+                        MessageType.Warning);
+                }
+                else
+                {
+                    EditorGUILayout.HelpBox(
+                        $"Lootcontainer '{lootName}' already exists in vanilla. " +
+                        "Your output will include a container with the same name — consider using a unique name to avoid conflicts.",
+                        MessageType.Info);
+                }
+
                 c.count = EditorGUILayout.IntField("count", c.count == 0 ? lootCountDefault : c.count);
                 c.size = EditorGUILayout.TextField("size (cols,rows)", string.IsNullOrEmpty(c.size) ? lootSizeDefault : c.size);
                 c.soundOpen = EditorGUILayout.TextField("sound_open", string.IsNullOrEmpty(c.soundOpen) ? lootOpenSound : c.soundOpen);
@@ -383,11 +459,25 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
                 c.qualityTemplate = EditorGUILayout.TextField("loot_quality_template", string.IsNullOrEmpty(c.qualityTemplate) ? lootQualityTemplate : c.qualityTemplate);
                 c.destroyOnClose = EditorGUILayout.Toggle("destroy_on_close", c.destroyOnClose ?? lootDestroyOnClose);
 
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    if (GUILayout.Button("Use unique name (prefix feel_)"))
+                    {
+                        string baseName = lootName;
+                        if (!baseName.StartsWith("feel_", StringComparison.OrdinalIgnoreCase))
+                            baseName = "feel_" + baseName;
+                        int idx = 1;
+                        string tryName = baseName;
+                        while (LootListExists(tryName)) { tryName = $"{baseName}_{idx++}"; }
+                        c.lootListName = tryName;
+                    }
+                    GUILayout.FlexibleSpace();
+                }
+
                 EditorGUILayout.Space(4);
                 EditorGUILayout.LabelField("Loot Items", EditorStyles.boldLabel);
                 if (c.items == null) c.items = GuessItems(c.blockName);
 
-                // header
                 using (new EditorGUILayout.HorizontalScope())
                 {
                     GUILayout.Label("Block?", GUILayout.Width(52));
@@ -403,7 +493,6 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
                     var it = c.items[i];
                     bool exists = it.isBlock ? validBlocks.Contains(it.name) : validItems.Contains(it.name);
 
-                    // tint the row when invalid
                     var oldBg = GUI.backgroundColor;
                     if (!exists) GUI.backgroundColor = new Color(1f, 0.78f, 0.78f);
 
@@ -411,7 +500,6 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
                     {
                         it.isBlock = EditorGUILayout.ToggleLeft("", it.isBlock, GUILayout.Width(52));
 
-                        // --- Autocomplete name field ---
                         string key = $"{selectedIndex}:{i}:{(it.isBlock ? "B" : "I")}";
                         if (!suggestStates.TryGetValue(key, out var s)) suggestStates[key] = s = new AutoSuggestState();
 
@@ -419,10 +507,9 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
                         GUI.SetNextControlName(key);
                         it.name = EditorGUILayout.TextField(it.name ?? "", GUILayout.MinWidth(160));
 
-                        // open suggestions when typing >= 2 chars or when previously open
-                        if (!string.Equals(before, it.name)) s.open = it.name != null && it.name.Length >= 2;
+                        if (!string.Equals(before, it.name, StringComparison.Ordinal))
+                            s.open = !string.IsNullOrEmpty(it.name) && it.name.Length >= 2;
 
-                        // Suggest from the correct catalog
                         if (s.open)
                         {
                             var src = it.isBlock ? validBlocks : validItems;
@@ -430,7 +517,6 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
                             if (s.suggestions.Count == 0) s.open = false;
                         }
 
-                        // Drop-down button
                         if (GUILayout.Button("▼", GUILayout.Width(22)))
                         {
                             var src = it.isBlock ? validBlocks : validItems;
@@ -438,7 +524,6 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
                             s.open = !s.open && s.suggestions.Count > 0;
                         }
 
-                        // render popup below the field
                         if (s.open && Event.current.type == EventType.Repaint)
                             s.lastRect = GUILayoutUtility.GetLastRect();
 
@@ -484,11 +569,32 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
                         c.items.Add(new LootItem { name = "resourceWood", count = "1", prob = "1", isBlock = false });
                     if (GUILayout.Button("Reset by Guess"))
                         c.items = GuessItems(c.blockName);
+                    GUILayout.FlexibleSpace();
                 }
             }
 
             EditorGUILayout.EndScrollView();
         }
+    }
+
+    // Small colored badge/pill
+    private static void DrawPill(string text, Color bg)
+    {
+        var style = new GUIStyle(EditorStyles.miniBoldLabel)
+        {
+            alignment = TextAnchor.MiddleCenter,
+            padding = new RectOffset(6, 6, 2, 2)
+        };
+        var r = GUILayoutUtility.GetRect(new GUIContent(text), style, GUILayout.ExpandWidth(false));
+        if (Event.current.type == EventType.Repaint)
+        {
+            var rr = new Rect(r.x, r.y + 2, r.width, r.height - 4);
+            EditorGUI.DrawRect(rr, bg);
+        }
+        var old = GUI.color;
+        GUI.color = Color.white;
+        GUI.Label(r, text, style);
+        GUI.color = old;
     }
 
     private static List<string> Suggest(HashSet<string> source, string query, int limit)
@@ -517,6 +623,7 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
         iconCache.Clear();
         validItems.Clear();
         validBlocks.Clear();
+        lootContainers.Clear();
         suggestStates.Clear();
         groupFoldouts.Clear();
         selectedIndex = -1;
@@ -524,30 +631,40 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
 
         string blocksPath = Path.Combine(configBasePath, "blocks.xml");
         string itemsPath = Path.Combine(configBasePath, "items.xml");
+        string lootPath = Path.Combine(configBasePath, "loot.xml");
+
         if (!File.Exists(blocksPath) || !File.Exists(itemsPath))
         {
             EditorUtility.DisplayDialog("Missing files", $"Expected:\n{blocksPath}\n{itemsPath}", "OK");
             return;
         }
 
-        // load catalogs for validation/autocomplete
         try
         {
+            // Items
             var xItems = XDocument.Load(itemsPath);
             foreach (var it in xItems.Root.Descendants("item").Where(e => e.Attribute("name") != null))
                 validItems.Add((string)it.Attribute("name"));
 
+            // Blocks
             var xBlocks = XDocument.Load(blocksPath);
             foreach (var b in xBlocks.Root.Descendants("block").Where(e => e.Attribute("name") != null))
                 validBlocks.Add((string)b.Attribute("name"));
-
-            // also keep a map for Extends + properties
             foreach (var b in xBlocks.Root.Descendants("block").Where(e => e.Attribute("name") != null))
                 blockByName[(string)b.Attribute("name")] = b;
 
-            // build skip lists
+            // Lootcontainers (vanilla)
+            if (File.Exists(lootPath))
+            {
+                var xLoot = XDocument.Load(lootPath);
+                foreach (var lc in xLoot.Descendants("lootcontainer").Where(e => e.Attribute("name") != null))
+                    lootContainers.Add((string)lc.Attribute("name"));
+            }
+
             var nameSkips = SplitCsv(skipNameContainsCsv);
             var tagSkips = SplitCsv(skipFilterTagsCsv);
+            if (!tagSkips.Contains("ignored", StringComparer.OrdinalIgnoreCase))
+                tagSkips.Add("ignored");
 
             foreach (var kv in blockByName)
             {
@@ -563,39 +680,32 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
                 if (nameSkips.Any(s => name.IndexOf(s, StringComparison.OrdinalIgnoreCase) >= 0))
                     continue;
 
-                // Skip by FilterTags
+                // Skip by FilterTags (any match OR contains 'ignored')
                 var tags = GetPropertyValue(e, "FilterTags");
                 if (!string.IsNullOrEmpty(tags))
                 {
-                    foreach (var t in tagSkips)
-                    {
-                        if (tags.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                                .Any(tok => tok.Trim().Equals(t, StringComparison.OrdinalIgnoreCase)))
-                        {
-                            goto nextBlock; // skip
-                        }
-                    }
+                    var tokens = tags.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(t => t.Trim());
+                    if (tokens.Any(t => t.Equals("ignored", StringComparison.OrdinalIgnoreCase)))
+                        continue;
+                    if (tagSkips.Count > 0 && tokens.Any(t => tagSkips.Contains(t, StringComparer.OrdinalIgnoreCase)))
+                        continue;
                 }
 
+                var info = new BlockInfo
                 {
-                    var info = new BlockInfo
-                    {
-                        blockName = name,
-                        extends = (string)e.Attribute("Extends"),
-                        customIcon = GetPropertyValue(e, "CustomIcon"),
-                        lootListName = name,
-                        size = lootSizeDefault,
-                        count = lootCountDefault,
-                        soundOpen = lootOpenSound,
-                        soundClose = lootCloseSound,
-                        qualityTemplate = lootQualityTemplate,
-                        destroyOnClose = lootDestroyOnClose,
-                        items = GuessItems(name)
-                    };
-                    candidates.Add(info);
-                }
-
-            nextBlock:;
+                    blockName = name,
+                    extends = (string)e.Attribute("Extends"),
+                    customIcon = GetPropertyValue(e, "CustomIcon"),
+                    lootListName = name, // default proposal
+                    size = lootSizeDefault,
+                    count = lootCountDefault,
+                    soundOpen = lootOpenSound,
+                    soundClose = lootCloseSound,
+                    qualityTemplate = lootQualityTemplate,
+                    destroyOnClose = lootDestroyOnClose,
+                    items = GuessItems(name)
+                };
+                candidates.Add(info);
             }
         }
         catch (Exception ex)
@@ -616,13 +726,21 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
             return;
         }
 
-        // Build mod folder
+        // Pre-flight: how many containers will be NEW vs existing
+        int willCreate = selected.Count(c => !LootListExists((c.lootListName ?? c.blockName).Trim()));
+        int willReuse = selected.Count - willCreate;
+
+        if (!EditorUtility.DisplayDialog(
+                "Generate lootables",
+                $"Selected: {selected.Count}\nWill create NEW lootcontainers: {willCreate}\nWill reuse existing names: {willReuse}\n\nProceed?",
+                "Generate", "Cancel"))
+            return;
+
         var modName = $"{modNameBase}";
         var modPath = Path.Combine(modsBasePath, modName);
         var cfgPath = Path.Combine(modPath, "Config");
         Directory.CreateDirectory(cfgPath);
 
-        // blocks.xml patch
         var blocksOut = Path.Combine(cfgPath, "blocks.xml");
         using (var w = new StreamWriter(blocksOut, false, new UTF8Encoding(false)))
         {
@@ -641,7 +759,6 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
             w.WriteLine("</configs>");
         }
 
-        // loot.xml patch
         var lootOut = Path.Combine(cfgPath, "loot.xml");
         using (var w = new StreamWriter(lootOut, false, new UTF8Encoding(false)))
         {
@@ -662,7 +779,7 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
                 var items = (c.items == null || c.items.Count == 0) ? GuessItems(c.blockName) : c.items;
                 foreach (var it in items)
                 {
-                    // skip invalid references silently to avoid broken loot
+                    // Only write valid names (UI already shows invalid rows in red)
                     if (it.isBlock && !validBlocks.Contains(it.name)) continue;
                     if (!it.isBlock && !validItems.Contains(it.name)) continue;
 
@@ -677,11 +794,12 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
             w.WriteLine("</configs>");
         }
 
-        // ModInfo + readme
         WriteModInfo(modPath, modName, modDescription, modAuthor, modVersion, modWebsite);
         File.WriteAllText(Path.Combine(modPath, "readme.md"), readmeMarkdown ?? "", new UTF8Encoding(false));
 
-        EditorUtility.DisplayDialog("Done", $"Generated:\n{blocksOut}\n{lootOut}\n\nMod: {modName}", "OK");
+        EditorUtility.DisplayDialog("Done",
+            $"Generated:\n{blocksOut}\n{lootOut}\n\nMod: {modName}\n\nNEW lootcontainers: {willCreate}\nReused names: {willReuse}",
+            "OK");
         Debug.Log($"[LootableMaker] Generated mod at: {modPath}");
     }
 
@@ -808,7 +926,7 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
         if (!showIcons) return null;
         if (iconCache.TryGetValue(info.blockName, out var t)) return t;
 
-        // throttle
+        // throttle loading strictly on repaint call sites
         if (iconsLoadedThisFrame >= IconLoadLimitPerFrame) return null;
 
         string[] tries = new[]
@@ -879,6 +997,12 @@ This mod makes selected decorative blocks lootable by appending Class=""Loot"" a
         var p = blockEl.Elements("property")
             .FirstOrDefault(x => (string)x.Attribute("name") == propName);
         return (string)p?.Attribute("value");
+    }
+
+    private bool LootListExists(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        return lootContainers.Contains(name);
     }
 
     private static string EscapeApos(string s) => s?.Replace("'", "&apos;") ?? "";
@@ -996,6 +1120,12 @@ $@"<?xml version=""1.0"" encoding=""UTF-8""?>
 
     // ---------- Data types ----------
 
+    private class GroupBucket
+    {
+        public string Key;
+        public List<BlockInfo> Items;
+    }
+
     private class BlockInfo
     {
         public string blockName;
@@ -1003,7 +1133,6 @@ $@"<?xml version=""1.0"" encoding=""UTF-8""?>
         public string customIcon;
         public bool selected;
 
-        // lootcontainer attrs
         public string lootListName;
         public int count;
         public string size;
